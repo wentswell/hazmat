@@ -22,6 +22,17 @@ if [[ -n $latest ]]; then
 	fi
 fi
 
+# A run on an older commit after a newer one was released (a re-run of a
+# failed job) would give the older commit the higher tag. Refuse when a
+# release of the series is on a commit that HEAD does not contain. A tag of the
+# series put on a commit outside the history of main stops every release in
+# this way, until that tag is moved or deleted.
+newer=$(git tag --list "v$series.*" --no-merged HEAD | head -n1)
+if [[ -n $newer ]]; then
+	echo "$newer is on a commit that HEAD does not contain: a newer commit is already released" >&2
+	exit 1
+fi
+
 last=$(git tag --list "v$series.*" --sort=-v:refname | head -n1)
 if [[ -z $last ]]; then
 	echo "v$series.0"

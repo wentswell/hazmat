@@ -9,9 +9,11 @@ import (
 	"github.com/wentswell/hazmat/internal/sniff"
 )
 
-// maxICC is the largest color profile the worker copies. A display profile is
-// a few KiB; a profile above this is not one the worker wants to carry.
-const maxICC = 1 << 20
+// maxICC is the largest color profile the worker copies. sRGB is 3 KiB and a
+// v4 display profile about 60 KiB. The profiles far above that are printer
+// profiles, which are not RGB, and a profile that size is not one the worker
+// wants to carry.
+const maxICC = 256 << 10
 
 // meta is what the worker reads from the container around the pixels. Only
 // orientation and icc change the output. The rest is reported to the caller.
@@ -33,9 +35,7 @@ func scan(b []byte, t sniff.Type) meta {
 	case sniff.WebP:
 		scanWebP(b, &m)
 	}
-	if !usableICC(m.icc) {
-		m.icc = nil
-	}
+	m.icc = rgbProfile(m.icc)
 	return m
 }
 
@@ -163,11 +163,65 @@ func inflate(b []byte, max int) []byte {
 	return out
 }
 
-// usableICC accepts only an RGB profile. The output is always an RGB JPEG, so
-// a CMYK or a gray profile on it would be wrong, and wrong is worse than none.
-func usableICC(icc []byte) bool {
-	return len(icc) >= 128 && len(icc) <= maxICC &&
-		string(icc[16:20]) == "RGB " && string(icc[36:40]) == "acsp"
+// maxICCTags is the most tags a profile may have. sRGB has 17.
+const maxICCTags = 64
+
+// rgbProfile returns icc when it is an RGB profile, cut to the size its header
+// declares, or nil. The output is always an RGB JPEG, so a CMYK or a gray
+// profile on it would be wrong, and wrong is worse than none. The profile is
+// the one part of the source the outputs carry, so it must be a profile in
+// structure and not only in its first bytes: the header, a tag table whose
+// tags are all inside the profile, and the tags that make an RGB profile.
+// The integers of a profile are big-endian (ICC.1).
+func rgbProfile(icc []byte) []byte {
+	if len(icc) < 132 || len(icc) > maxICC {
+		return nil
+	}
+	// A profile followed by padding is kept, without the padding.
+	size := uint64(binary.BigEndian.Uint32(icc))
+	if size < 132 || size > uint64(len(icc)) {
+		return nil
+	}
+	icc = icc[:size]
+	switch string(icc[12:16]) { // device class
+	case "scnr", "mntr", "prtr", "spac":
+	default:
+		return nil
+	}
+	switch string(icc[20:24]) { // profile connection space
+	case "XYZ ", "Lab ":
+	default:
+		return nil
+	}
+	if string(icc[16:20]) != "RGB " || string(icc[36:40]) != "acsp" {
+		return nil
+	}
+	n := uint64(binary.BigEndian.Uint32(icc[128:]))
+	if n < 1 || n > maxICCTags || 132+12*n > size {
+		return nil
+	}
+	table := 132 + 12*n
+	tags := map[string]bool{}
+	for i := uint64(0); i < n; i++ {
+		e := icc[132+12*i:]
+		// Each tag starts after the table and ends in the profile, and
+		// holds at least its type signature and the four reserved bytes.
+		off, length := uint64(binary.BigEndian.Uint32(e[4:])), uint64(binary.BigEndian.Uint32(e[8:]))
+		if off < table || length < 8 || off+length > size {
+			return nil
+		}
+		tags[string(e[:4])] = true
+	}
+	// A matrix and three curves, or a lookup table from the device to the
+	// connection space.
+	matrix := true
+	for _, sig := range []string{"rXYZ", "gXYZ", "bXYZ", "rTRC", "gTRC", "bTRC"} {
+		matrix = matrix && tags[sig]
+	}
+	if !matrix && !tags["A2B0"] {
+		return nil
+	}
+	return icc
 }
 
 // parseTIFF reads the two EXIF facts the worker uses: the orientation, and

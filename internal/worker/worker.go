@@ -42,8 +42,8 @@ type Worker struct {
 
 // Process has three results. A response with status ok: the outputs exist. A
 // response with status refused: the file is the problem. An error: the request
-// is wrong (*contract.InvalidRequestError), or the storage failed
-// (*contract.StorageError).
+// is wrong (*contract.InvalidRequestError), the storage failed
+// (*contract.StorageError), or the worker itself failed (*contract.WorkerError).
 func (w *Worker) Process(ctx context.Context, req contract.Request) (contract.Response, error) {
 	began := time.Now()
 	resp := contract.Response{
@@ -51,8 +51,9 @@ func (w *Worker) Process(ctx context.Context, req contract.Request) (contract.Re
 		Worker: contract.WorkerInfo{Version: w.Version, FFmpeg: w.FFmpegVersion, ConfigHash: w.Config.Hash()},
 	}
 
-	err := w.process(ctx, req, &resp)
-	w.recycle(resp, err)
+	var decoded bool
+	err := w.process(ctx, req, &resp, &decoded)
+	w.recycle(err, decoded)
 	var refusal *contract.Refusal
 	switch {
 	case err == nil:
@@ -67,7 +68,8 @@ func (w *Worker) Process(ctx context.Context, req contract.Request) (contract.Re
 	return resp, nil
 }
 
-func (w *Worker) process(ctx context.Context, req contract.Request, resp *contract.Response) error {
+// decoded is set when the file went to the video tools, whatever the result.
+func (w *Worker) process(ctx context.Context, req contract.Request, resp *contract.Response, decoded *bool) error {
 	if err := contract.Validate(req, w.Config); err != nil {
 		return err
 	}
@@ -131,6 +133,7 @@ func (w *Worker) process(ctx context.Context, req contract.Request, resp *contra
 
 	var outputs []output
 	if t.IsVideo() {
+		*decoded = true
 		outputs, err = w.video(ctx, req, resp, data.Bytes(), t)
 	} else {
 		outputs, err = w.photo(req, resp, data.Bytes(), t)
@@ -193,16 +196,16 @@ func (w *Worker) video(ctx context.Context, req contract.Request, resp *contract
 	// second directory, which is all the child process writes.
 	dir, err := os.MkdirTemp("", "hazmat-")
 	if err != nil {
-		return nil, fmt.Errorf("make the work directory: %w", err)
+		return nil, contract.Fail("make the work directory: %w", err)
 	}
 	defer os.RemoveAll(dir)
 	source := filepath.Join(dir, "source")
 	frames := filepath.Join(dir, "frames")
 	if err := os.WriteFile(source, data, 0o600); err != nil {
-		return nil, fmt.Errorf("write the source to the work directory: %w", err)
+		return nil, contract.Fail("write the source to the work directory: %w", err)
 	}
 	if err := os.Mkdir(frames, 0o700); err != nil {
-		return nil, fmt.Errorf("make the frame directory: %w", err)
+		return nil, contract.Fail("make the frame directory: %w", err)
 	}
 
 	opts := req.Video
@@ -245,12 +248,13 @@ func (w *Worker) video(ctx context.Context, req contract.Request, resp *contract
 // recycle ends the execution environment when the configuration says so. A
 // child process that timed out or died on a signal is the sign of a hostile
 // file; the next request must not run beside what that file left behind.
-func (w *Worker) recycle(resp contract.Response, err error) {
+// "always" is after every video that went to the tools, refused or not: the
+// refused ones are the likeliest to be hostile.
+func (w *Worker) recycle(err error, wasVideo bool) {
 	if w.Recycle == nil {
 		return
 	}
 	var abnormal *video.Abnormal
-	_, wasVideo := resp.Media.(*contract.VideoFacts)
 	switch w.Config.Recycle {
 	case config.RecycleAlways:
 		if wasVideo || errors.As(err, &abnormal) {
@@ -296,12 +300,15 @@ func (w *Worker) log(req contract.Request, resp contract.Response, err error, to
 	case err != nil:
 		var invalid *contract.InvalidRequestError
 		var storage *contract.StorageError
+		var failed *contract.WorkerError
 		result := "error"
 		switch {
 		case errors.As(err, &invalid):
 			result = "invalid_request"
 		case errors.As(err, &storage):
 			result = "storage_error"
+		case errors.As(err, &failed):
+			result = "worker_error"
 		}
 		w.Log.Error("request", append(attrs, "result", result, "error", err.Error())...)
 	case resp.Refusal != nil:

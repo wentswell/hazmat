@@ -130,6 +130,50 @@ func TestValidateVideo(t *testing.T) {
 	}
 }
 
+// The frames of a video are written below the prefix, so a source key that is
+// the name of one of them would be overwritten by its own frame.
+func TestValidateFrameOverwrite(t *testing.T) {
+	cases := []struct {
+		name, key string
+		expect    Kind
+		bucket    string
+		ok        bool
+	}{
+		{"first frame, video", "uploads/m1/frame_01.jpg", KindVideo, "cdn", false},
+		{"first frame, any", "uploads/m1/frame_01.jpg", KindAny, "cdn", false},
+		{"last frame of the ceiling", "uploads/m1/frame_32.jpg", KindVideo, "cdn", false},
+		{"past the ceiling", "uploads/m1/frame_33.jpg", KindVideo, "cdn", true},
+		{"three digits past the ceiling", "uploads/m1/frame_100.jpg", KindVideo, "cdn", true},
+		{"other output bucket", "uploads/m1/frame_01.jpg", KindVideo, "media", true},
+		{"one digit", "uploads/m1/frame_1.jpg", KindVideo, "cdn", true},
+		{"frame zero", "uploads/m1/frame_00.jpg", KindVideo, "cdn", true},
+		{"a sign", "uploads/m1/frame_+1.jpg", KindVideo, "cdn", true},
+		{"no extension", "uploads/m1/frame_01", KindVideo, "cdn", true},
+		{"below the prefix", "uploads/m1/x/frame_01.jpg", KindVideo, "cdn", true},
+		{"other prefix", "uploads/m2/frame_01.jpg", KindVideo, "cdn", true},
+		{"long digits", "uploads/m1/frame_99999999999999999999.jpg", KindVideo, "cdn", true},
+	}
+	cfg := s3Config()
+	cfg.AllowedBuckets = []string{"cdn", "media"}
+	for _, c := range cases {
+		req := good()
+		req.Expect, req.Video = c.expect, goodVideo()
+		if c.expect == KindVideo {
+			req.Photo = nil
+		}
+		req.Source.Key = c.key
+		req.Output = Output{Bucket: c.bucket, Prefix: "uploads/m1/"}
+		err := Validate(req, cfg)
+		var invalid *InvalidRequestError
+		switch {
+		case c.ok && err != nil:
+			t.Errorf("%s: %v", c.name, err)
+		case !c.ok && !errors.As(err, &invalid):
+			t.Errorf("%s: want an invalid_request error, got %v", c.name, err)
+		}
+	}
+}
+
 func TestValidateFileStore(t *testing.T) {
 	cfg := config.Config{Store: config.StoreFile, FileRoot: "/tmp/x", MaxOutputEdge: 4096, MaxRenditions: 4}
 	req := good()

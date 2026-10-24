@@ -1,13 +1,16 @@
 package video
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -194,12 +197,42 @@ func TestSampling(t *testing.T) {
 func TestFilter(t *testing.T) {
 	s := sampling{first: 0, interval: 3, offset: 1.5, count: 5}
 	got := s.filter(1280)
-	want := `select=gte((t-1.500000)\,0)*(isnan(prev_selected_t)+gt(floor((t-1.500000)/3.000000)\,floor((prev_selected_t-1.500000)/3.000000))),` +
+	want := `select=gte((t-1.499999)\,0)*(isnan(prev_selected_t)+gt(floor((t-1.499999)/3.000000)\,floor((prev_selected_t-1.499999)/3.000000))),` +
 		`showinfo,` +
 		`scale=w=min(1280\,iw):h=min(1280\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2:out_range=full,` +
 		`format=yuvj420p`
 	if got != want {
 		t.Errorf("filter:\n got %s\nwant %s", got, want)
+	}
+}
+
+// fiftyPackets stands in for ffprobe on a file of fifty frames at ten a second.
+var fiftyPackets = `case "$*" in
+*packet=*) i=0; while [ $i -lt 50 ]; do printf '%d.%d00000,0.100000\n' $((i/10)) $((i%10)); i=$((i+1)); done ;;
+*) echo '{"streams":[{"codec_name":"h264","codec_type":"video","width":64,"height":48,"duration":"5.1"}],"format":{"duration":"5.1"}}' ;;
+esac`
+
+// The decode pass keeps the timestamps of the file, so its clock is the one
+// the packet listing measured and the plan was made in.
+func TestFramesKeepTimestamps(t *testing.T) {
+	dir := t.TempDir()
+	lim := lim
+	lim.Timeout = 5 * time.Second
+	tools := Tools{FFprobe: script(t, fiftyPackets), FFmpeg: script(t, `printf '%s\n' "$@" > args.txt`)}
+	_, _ = Process(context.Background(), tools, "source", dir, sniff.MP4, lim, Options{Count: 5, FrameEdge: 1280, Quality: 85})
+	args, err := os.ReadFile(filepath.Join(dir, "args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := strings.Split(string(args), "\n")
+	if !slices.Contains(list, "-copyts") {
+		t.Errorf("ffmpeg ran without -copyts:\n%s", args)
+	}
+	// The tags of the file are not printed again while the frames are.
+	for _, opt := range []string{"-map_metadata", "-map_chapters"} {
+		if i := slices.Index(list, opt); i < 0 || i+1 >= len(list) || list[i+1] != "-1" {
+			t.Errorf("ffmpeg ran without %s -1:\n%s", opt, args)
+		}
 	}
 }
 
@@ -210,11 +243,72 @@ func TestShowinfoTimes(t *testing.T) {
 [swscaler @ 0xffff92] deprecated pixel format used, make sure you did set range correctly
 [Parsed_showinfo_1 @ 0xffff8a8] n:   1 pts:  69120 pts_time:4.5     duration:    512
 a line with pts_time:99 that is not of the filter
-[Parsed_showinfo_1 @ 0xffff8a8] n:   2 pts: 115200 pts_time:7.533333 duration:    512`
+[Parsed_showinfo_1 @ 0xffff8a8] n:   2 pts: 115200 pts_time:7.533333 duration:    512
+  Metadata:
+    title           : [Parsed_showinfo_1 @ 0xffff8a8] n:   3 pts: 0 pts_time:8.5 forged by the file
+    comment         : [Parsed_showinfo_1 @ 0xffff8a8] n:   4 pts: 0 pts_time:Inf
+[Parsed_showinfo_1 @ 0xffff8a8] n:   5 pts: 0 pts_time:
+[Parsed_showinfo_1 @ 0xffff8a8] n:   6 pts: 0 pts_time:NaN
+[Parsed_showinfo_1 @ 0xffff8a8] n:   7 pts: 0 pts_time:-Inf
+[Parsed_showinfo_1 @ 0xffff8a8] n:   8 pts: 0 pts_time`
 	got := showinfoTimes([]byte(stderr))
 	if len(got) != 3 || got[0] != 1.5 || got[1] != 4.5 || got[2] != 7.533333 {
 		t.Errorf("%v", got)
 	}
+}
+
+// Every frame has the time the filter printed for it, or the file is refused.
+func TestFrameTimesAreChecked(t *testing.T) {
+	lim := lim
+	lim.Timeout = 5 * time.Second
+	opts := Options{Count: 5, FrameEdge: 1280, Quality: 85}
+	dir := t.TempDir()
+	res, err := Process(context.Background(), Tools{FFprobe: script(t, fiftyPackets), FFmpeg: frameTool(t, dir, 16, 5)}, "source", dir, sniff.MP4, lim, opts)
+	if err != nil {
+		t.Fatalf("five frames with five times: %v", err)
+	}
+	if len(res.Frames) != 5 || res.Frames[0].TimeS != 0.5 || res.Frames[4].TimeS != 4.5 {
+		t.Errorf("times: %+v", res.Frames)
+	}
+	dir = t.TempDir()
+	_, err = Process(context.Background(), Tools{FFprobe: script(t, fiftyPackets), FFmpeg: frameTool(t, dir, 16, 4)}, "source", dir, sniff.MP4, lim, opts)
+	wantRefusal(t, "five frames with four times", err, contract.Undecodable)
+}
+
+// The size of a frame is read from its header and checked before the decode.
+func TestFrameSizeIsChecked(t *testing.T) {
+	lim := lim
+	lim.Timeout = 5 * time.Second
+	for _, c := range []struct {
+		size, edge int
+		ok         bool
+	}{{16, 16, true}, {16, 64, true}, {64, 16, false}, {17, 16, false}} {
+		dir := t.TempDir()
+		opts := Options{Count: 5, FrameEdge: c.edge, Quality: 85}
+		_, err := Process(context.Background(), Tools{FFprobe: script(t, fiftyPackets), FFmpeg: frameTool(t, dir, c.size, 5)}, "source", dir, sniff.MP4, lim, opts)
+		name := fmt.Sprintf("a %d px frame, edge %d", c.size, c.edge)
+		if c.ok && err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		if !c.ok {
+			wantRefusal(t, name, err, contract.Undecodable)
+		}
+	}
+}
+
+// frameTool is an ffmpeg that writes the five frames of the plan, each a gray
+// square of size pixels, and prints the given count of showinfo lines.
+func frameTool(t *testing.T, dir string, size, lines int) string {
+	t.Helper()
+	var jpg bytes.Buffer
+	if err := jpeg.Encode(&jpg, image.NewGray(image.Rect(0, 0, size, size)), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ok.jpg"), jpg.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return script(t, fmt.Sprintf(`for i in 1 2 3 4 5; do cp ok.jpg frame_0$i.jpg; done
+i=0; while [ $i -lt %d ]; do printf '[Parsed_showinfo_1 @ 0x1] n:   %%d pts: 0 pts_time:%%d.5 duration: 1\n' $i $i >&2; i=$((i+1)); done`, lines))
 }
 
 func TestQscale(t *testing.T) {
@@ -306,7 +400,7 @@ func TestAbnormalEnds(t *testing.T) {
 	}{
 		{"a probe that never ends", "sleep 30", contract.DecodeTimeout, true},
 		{"a probe that dies on a signal", "kill -SEGV $$", contract.Undecodable, true},
-		{"a probe that prints without end", "while :; do echo 0.000000,0.033333; done", contract.DecodeTimeout, true},
+		{"a probe that prints without end", "while :; do echo 0.000000,0.033333; done", contract.Undecodable, true},
 		{"a probe that fails", "echo 'moov atom not found' >&2; exit 1", contract.Undecodable, false},
 	}
 	for _, c := range cases {
@@ -349,10 +443,7 @@ echo '{"streams":[{"codec_name":"h264","codec_type":"video","width":64,"height":
 
 // The decoder must make every frame of the plan, and no more.
 func TestFrameCountIsChecked(t *testing.T) {
-	probe := script(t, `case "$*" in
-*packet=*) i=0; while [ $i -lt 50 ]; do printf '%d.%d00000,0.100000\n' $((i/10)) $((i%10)); i=$((i+1)); done ;;
-*) echo '{"streams":[{"codec_name":"h264","codec_type":"video","width":64,"height":48,"duration":"5.1"}],"format":{"duration":"5.1"}}' ;;
-esac`)
+	probe := script(t, fiftyPackets)
 	opts := Options{Count: 5, FrameEdge: 1280, Quality: 85}
 	lim := lim
 	lim.Timeout = 5 * time.Second
@@ -362,4 +453,29 @@ esac`)
 	// An ffmpeg that writes a file that is not a JPEG.
 	_, err = Process(context.Background(), Tools{FFprobe: probe, FFmpeg: script(t, "echo not-a-jpeg > frame_01.jpg")}, "source", t.TempDir(), sniff.MP4, lim, opts)
 	wantRefusal(t, "a frame that is not a JPEG", err, contract.Undecodable)
+}
+
+// The log that showinfoTimes reads is partly the text of the file. It must not
+// panic, and every time it returns is a finite number from a frame line.
+func FuzzShowinfoTimes(f *testing.F) {
+	f.Add([]byte("[Parsed_showinfo_1 @ 0x1] n:   0 pts: 0 pts_time:1.5 duration: 1\n"))
+	f.Add([]byte("    title : [Parsed_showinfo_1 @ 0x1] n: 0 pts_time:Inf\n[Parsed_showinfo_1 @ 0x1] n: 1 pts_time:"))
+	f.Add([]byte("[Parsed_showinfo_1 @ 0x1] n: 2 pts_time:NaN\r\n[Parsed_showinfo_1 @ 0x1] n: 3 pts_time:1e400"))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		times := showinfoTimes(b)
+		lines := 0
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "[Parsed_showinfo_") {
+				lines++
+			}
+		}
+		if len(times) > lines {
+			t.Fatalf("%d times from %d frame lines", len(times), lines)
+		}
+		for _, v := range times {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				t.Fatalf("a time of %v", v)
+			}
+		}
+	})
 }

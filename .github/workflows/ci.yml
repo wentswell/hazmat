@@ -55,6 +55,9 @@ jobs:
     permissions:
       contents: write
     # One release at a time, so two quick merges can't pick the same tag.
+    # GitHub keeps one pending run in the group: a third push while one runs
+    # replaces the pending one, and that middle commit is not released. The
+    # next release holds its change.
     concurrency:
       group: release
       cancel-in-progress: false
@@ -89,7 +92,9 @@ jobs:
 
       - name: Build
         if: steps.version.outputs.tag != ''
-        run: make dist VERSION=${{ steps.version.outputs.tag }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: make dist VERSION="$TAG"
 
       - name: Publish the release
         if: steps.version.outputs.tag != ''

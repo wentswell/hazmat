@@ -25,14 +25,18 @@ type Limits struct {
 type Result struct {
 	Stdout, Stderr []byte
 	ExitCode       int
-	// TimedOut and Signaled say the child did not end by itself. After
-	// either, the worker does not trust this execution environment.
-	TimedOut bool
-	Signaled bool
+	// TimedOut, Signaled and Overflowed say the child did not end by
+	// itself. After any of them, the worker does not trust this execution
+	// environment. Overflowed is a child that printed more than StdoutBytes
+	// and was stopped; it is not also TimedOut or Signaled, though the stop
+	// is the same kill.
+	TimedOut   bool
+	Signaled   bool
+	Overflowed bool
 }
 
 // Abnormal reports an end that a correct decoder on a correct file never has.
-func (r Result) Abnormal() bool { return r.TimedOut || r.Signaled }
+func (r Result) Abnormal() bool { return r.TimedOut || r.Signaled || r.Overflowed }
 
 const stderrBytes = 64 << 10
 
@@ -64,13 +68,14 @@ func Run(ctx context.Context, lim Limits, dir, name string, args ...string) (Res
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 
 	res := Result{Stdout: stdout.buf.Bytes(), Stderr: stderr.buf.Bytes()}
-	res.TimedOut = ctx.Err() != nil
+	res.Overflowed = stdout.over
+	res.TimedOut = ctx.Err() != nil && !res.Overflowed
 	var exit *exec.ExitError
 	switch {
 	case err == nil:
 	case errors.As(err, &exit):
 		res.ExitCode = exit.ExitCode()
-		if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() && !res.Overflowed {
 			res.Signaled = true
 		}
 	default:
@@ -86,12 +91,14 @@ type capped struct {
 	buf  bytes.Buffer
 	max  int
 	stop func()
+	over bool // more than max bytes came
 }
 
 func (c *capped) Write(p []byte) (int, error) {
 	if room := c.max - c.buf.Len(); room >= len(p) {
 		c.buf.Write(p)
 	} else {
+		c.over = true
 		if room > 0 {
 			c.buf.Write(p[:room])
 		}

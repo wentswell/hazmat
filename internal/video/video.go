@@ -137,10 +137,19 @@ func Process(ctx context.Context, tools Tools, path, dir string, t sniff.Type, l
 	// Fail closed: every frame the plan names must exist. A file that decodes
 	// in part hides the rest from the scan.
 	for i := 0; i < plan.count; i++ {
-		name := fmt.Sprintf("frame_%02d", i+1)
+		name := contract.FrameName(i + 1)
 		data, err := os.ReadFile(filepath.Join(dir, name+".jpg"))
 		if err != nil {
 			return nil, contract.Refuse(contract.Undecodable, "the decoder made %d of %d frames", i, plan.count)
+		}
+		// The header first: the frame is the work of a child process that
+		// read a hostile file, so its size is checked before the decode.
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return nil, contract.Refuse(contract.Undecodable, "frame %d of the decoder is not a JPEG", i+1)
+		}
+		if cfg.Width <= 0 || cfg.Height <= 0 || max(cfg.Width, cfg.Height) > opts.FrameEdge {
+			return nil, contract.Refuse(contract.Undecodable, "frame %d of the decoder is empty or above the edge %d", i+1, opts.FrameEdge)
 		}
 		img, err := jpeg.Decode(bytes.NewReader(data))
 		if err != nil {
@@ -153,8 +162,14 @@ func Process(ctx context.Context, tools Tools, path, dir string, t sniff.Type, l
 		}
 		res.Frames = append(res.Frames, f)
 	}
-	if extra := fmt.Sprintf("frame_%02d.jpg", plan.count+1); exists(filepath.Join(dir, extra)) {
+	if extra := contract.FrameName(plan.count+1) + ".jpg"; exists(filepath.Join(dir, extra)) {
 		return nil, contract.Refuse(contract.Undecodable, "the decoder made more than %d frames", plan.count)
+	}
+	// The time of a frame is a measured fact. One frame line of the filter
+	// for each frame, or the times are not known: the log was cut, or the
+	// file wrote into it.
+	if len(times) != plan.count {
+		return nil, contract.Refuse(contract.Undecodable, "the decoder reported %d times for %d frames", len(times), plan.count)
 	}
 	res.Decode = time.Since(start)
 	return res, nil
@@ -179,7 +194,7 @@ func (r runner) run(stdoutBytes int, name string, args ...string) (sandbox.Resul
 		StdoutBytes: stdoutBytes,
 	}, r.dir, name, args...)
 	if err != nil {
-		return res, fmt.Errorf("start %s: %w", filepath.Base(name), err)
+		return res, contract.Fail("start %s: %w", filepath.Base(name), err)
 	}
 	return res, nil
 }
@@ -188,6 +203,8 @@ func (r runner) run(stdoutBytes int, name string, args ...string) (sandbox.Resul
 // exit. The text of the child is not in the detail: the file controls it.
 func refusal(tool string, res sandbox.Result) error {
 	switch {
+	case res.Overflowed:
+		return &Abnormal{contract.Refuse(contract.Undecodable, "%s printed more than its limit", tool)}
 	case res.TimedOut:
 		return &Abnormal{contract.Refuse(contract.DecodeTimeout, "%s did not finish in time", tool)}
 	case res.Signaled:
@@ -234,10 +251,20 @@ func (r runner) frames(path string, plan sampling, lim Limits, opts Options) ([]
 	args := []string{"-nostdin", "-hide_banner", "-nostats", "-loglevel", "info"}
 	args = append(args, inputFlags...)
 	args = append(args,
+		// The plan and the times of the frames are in the clock of the
+		// packets that ffprobe listed. Without -copyts, ffmpeg moves the
+		// first timestamp of the input to zero, so a file whose packets do
+		// not start at zero is sampled at the wrong times and refused. The
+		// input -t is still counted from the first packet.
+		"-copyts",
 		// A second stop behind the measured duration.
 		"-t", ftoa(lim.MaxSeconds+1),
 		"-i", path,
 		"-map", "0:v:0", "-an", "-sn", "-dn",
+		// The output gets no tag or chapter of the file. ffmpeg prints the
+		// output header from another thread while the filter prints its
+		// frame lines, so tags there could break into those lines.
+		"-map_metadata", "-1", "-map_chapters", "-1",
 		"-vf", plan.filter(opts.FrameEdge),
 		"-fps_mode", "passthrough",
 		"-frames:v", strconv.Itoa(plan.count+1),
@@ -288,9 +315,15 @@ func newSampling(p *packets, opts Options) sampling {
 // is after the interval of the frame taken before it, so one late frame does
 // not move the samples that follow.
 func (s sampling) filter(edge int) string {
-	rel := fmt.Sprintf("(t-%s)", ftoa(s.first+s.offset))
+	// The intervals start one microsecond early, the precision of the
+	// numbers here. A frame exactly at the start of an interval then belongs
+	// to it, as in newSampling, whatever the rounding of t-start: 7.0-5.4 is
+	// 1.5999999999999996, and without the margin the frame at 7 s would go
+	// to the interval before.
+	start := ftoa(s.first + s.offset - 1e-6)
+	rel := fmt.Sprintf("(t-%s)", start)
 	bucket := func(t string) string {
-		return fmt.Sprintf("floor((%s-%s)/%s)", t, ftoa(s.first+s.offset), ftoa(s.interval))
+		return fmt.Sprintf("floor((%s-%s)/%s)", t, start, ftoa(s.interval))
 	}
 	sel := fmt.Sprintf("gte(%s,0)*(isnan(prev_selected_t)+gt(%s,%s))", rel, bucket("t"), bucket("prev_selected_t"))
 	// In a filter chain a comma separates filters, so the commas of the
@@ -307,20 +340,31 @@ func (s sampling) filter(edge int) string {
 	}, ",")
 }
 
-// showinfoTimes reads the pts_time of each line the showinfo filter printed.
+// showinfoTimes reads the pts_time of each frame line the showinfo filter
+// printed. The same stream carries the metadata of the file, which ffmpeg
+// prints indented, so only a line that starts with the name of the filter is
+// one of its own, and only a finite number is a time it measured. A line the
+// file forged, or one the stderr cap cut, is left out, and the count of
+// times then differs from the count of frames, which refuses the file.
 func showinfoTimes(stderr []byte) []float64 {
 	var times []float64
 	for _, line := range strings.Split(string(stderr), "\n") {
-		if !strings.Contains(line, "Parsed_showinfo") {
+		if !strings.HasPrefix(line, "[Parsed_showinfo_") || !strings.Contains(line, " n:") {
 			continue
 		}
-		_, after, ok := strings.Cut(line, "pts_time:")
+		_, after, ok := strings.Cut(line, " pts_time:")
 		if !ok {
 			continue
 		}
-		if v, err := strconv.ParseFloat(strings.Fields(after)[0], 64); err == nil {
-			times = append(times, v)
+		fields := strings.Fields(after)
+		if len(fields) == 0 {
+			continue
 		}
+		v, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		times = append(times, v)
 	}
 	return times
 }

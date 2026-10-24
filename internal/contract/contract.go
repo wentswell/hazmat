@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/wentswell/hazmat/internal/config"
@@ -213,6 +214,20 @@ type StorageError struct{ Err error }
 func (e *StorageError) Error() string { return "storage: " + e.Err.Error() }
 func (e *StorageError) Unwrap() error { return e.Err }
 
+// WorkerError says the worker itself failed: a work directory, a child process
+// that did not start, an encoder. It is not the file and not the request, so
+// the caller can try again. On Lambda the type name is the errorType of the
+// function error.
+type WorkerError struct{ Err error }
+
+func (e *WorkerError) Error() string { return "worker: " + e.Err.Error() }
+func (e *WorkerError) Unwrap() error { return e.Err }
+
+// Fail wraps an error of the worker itself.
+func Fail(format string, args ...any) error {
+	return &WorkerError{Err: fmt.Errorf(format, args...)}
+}
+
 func invalid(format string, args ...any) error {
 	return &InvalidRequestError{Reason: fmt.Sprintf(format, args...)}
 }
@@ -303,8 +318,30 @@ func Validate(req Request, cfg config.Config) error {
 		if err := checkVideo(*req.Video, cfg); err != nil {
 			return err
 		}
+		if req.Output.Bucket == req.Source.Bucket {
+			if i, ok := frameIndex(req.Output.Prefix, req.Source.Key); ok && i <= cfg.MaxFrames {
+				return invalid("%s would overwrite the source", FrameName(i))
+			}
+		}
 	}
 	return nil
+}
+
+// frameIndex is i when key is where frame i is written below prefix.
+func frameIndex(prefix, key string) (int, bool) {
+	rest, ok := strings.CutPrefix(key, prefix)
+	if !ok {
+		return 0, false
+	}
+	digits, ok := strings.CutPrefix(strings.TrimSuffix(rest, ".jpg"), "frame_")
+	if !ok || len(digits) > 9 {
+		return 0, false
+	}
+	i, err := strconv.Atoi(digits)
+	if err != nil || i < 1 || OutputKey(prefix, FrameName(i)) != key {
+		return 0, false
+	}
+	return i, true
 }
 
 func checkVideo(v VideoOptions, cfg config.Config) error {

@@ -75,6 +75,29 @@ func TestTooMuchOutputStopsTheChild(t *testing.T) {
 	if len(res.Stdout) != 1<<10 || !res.Abnormal() || time.Since(start) > 3*time.Second {
 		t.Errorf("stdout %d bytes, %+v, %s", len(res.Stdout), res, time.Since(start))
 	}
+	// Nothing timed out and the child sent itself no signal.
+	if !res.Overflowed || res.TimedOut || res.Signaled {
+		t.Errorf("want an overflow and nothing else: %+v", res)
+	}
+	// Exactly the limit is not too much.
+	res, err = Run(context.Background(), lim, t.TempDir(), "/bin/sh", "-c", "head -c 1024 /dev/zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Stdout) != 1<<10 || res.Overflowed || res.Abnormal() || res.ExitCode != 0 {
+		t.Errorf("1 KiB of 1 KiB: %d bytes, %+v", len(res.Stdout), res)
+	}
+}
+
+// A lot on stderr is cut, not a stop: stderr is for the frame lines.
+func TestStderrIsCutNotStopped(t *testing.T) {
+	res, err := Run(context.Background(), lim, t.TempDir(), "/bin/sh", "-c", "head -c 200000 /dev/zero >&2; echo done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Stderr) != stderrBytes || res.Abnormal() || strings.TrimSpace(string(res.Stdout)) != "done" {
+		t.Errorf("stderr %d bytes, %+v", len(res.Stderr), res)
+	}
 }
 
 func TestMissingProgram(t *testing.T) {
