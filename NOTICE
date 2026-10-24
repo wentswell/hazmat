@@ -1,0 +1,16 @@
+hazmat
+Copyright 2026 WS Tech, LLC
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The release zip also holds third-party software:
+
+- bin/ffmpeg and bin/ffprobe are built from FFmpeg (https://ffmpeg.org), which
+  is licensed under the GNU Lesser General Public License, version 2.1 or later.
+  The zip holds that license at bin/COPYING.LGPLv2.1. Each GitHub release has
+  the unmodified FFmpeg source as an asset (ffmpeg-<version>.tar.xz).
+  ffmpeg/Dockerfile and bin/ffmpeg-buildconf.txt give the configure line. The
+  worker runs ffmpeg and ffprobe as separate programs; it does not link them.
+
+- bootstrap is compiled from Go modules under their own licenses. The zip
+  holds the license and notice files of each module in licenses/.

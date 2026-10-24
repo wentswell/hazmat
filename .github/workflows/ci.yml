@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Both jobs run on arm64. The release is arm64 only, and it holds ffmpeg and
+  # ffprobe, which are built for the architecture of the runner.
+  test:
+    name: test
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # ffmpeg takes a few minutes to build. The key is the Dockerfile, which
+      # holds the source pin and the configure line.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist/ffmpeg
+          key: ffmpeg-${{ runner.arch }}-${{ hashFiles('ffmpeg/Dockerfile') }}
+
+      - name: gofmt + vet + test
+        run: make test
+
+      # A short run of each fuzz target. The decoders read hostile files, so a
+      # crash here is a release blocker.
+      - name: Fuzz
+        run: make fuzz FUZZTIME=30s
+
+      # The binary and ffmpeg inside the Lambda runtime image, against a local
+      # S3 API.
+      - name: Lambda runtime + S3 test
+        run: make local-test
+
+      - name: Build the Lambda zip
+        run: make dist
+
+  # Every push to main that passes the tests is a release: vMAJOR.MINOR.PATCH,
+  # MAJOR.MINOR from the VERSION file, PATCH counted up from the last tag.
+  # A deployment pins a release by its tag and by the sha256 in checksums.txt.
+  release:
+    name: release
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    # One release at a time, so two quick merges can't pick the same tag.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags, for next-version.sh
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # ffmpeg takes a few minutes to build. The key is the Dockerfile, which
+      # holds the source pin and the configure line.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist/ffmpeg
+          key: ffmpeg-${{ runner.arch }}-${{ hashFiles('ffmpeg/Dockerfile') }}
+
+      - name: Pick the version
+        id: version
+        run: |
+          existing=$(git tag --points-at HEAD --list 'v*.*.*' | head -n1)
+          if [ -n "$existing" ]; then
+            echo "HEAD is already released as $existing; nothing to do"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            tag=$(scripts/next-version.sh)
+            echo "Releasing $tag"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.version.outputs.tag != ''
+        run: make dist VERSION=${{ steps.version.outputs.tag }}
+
+      - name: Publish the release
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Name the assets. dist/ also holds the ffmpeg build directory. The
+          # ffmpeg source goes with each release, as the LGPL asks.
+          gh release create "$TAG" dist/*.zip dist/checksums.txt dist/ffmpeg/ffmpeg-*.tar.xz \
+            --target "$GITHUB_SHA" \
+            --title "hazmat $TAG" \
+            --generate-notes

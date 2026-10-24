@@ -1,0 +1,40 @@
+# The worker as Lambda runs it, with no AWS account: the Lambda runtime image
+# starts the release binary, and S3Mock is the S3 bucket. `make local-test`
+# starts this, runs the tests in this directory, and stops it.
+services:
+  s3:
+    # Pinned by digest: this is a test double, and a new version must not
+    # change a result without a change here.
+    image: adobe/s3mock@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+    ports:
+      - "127.0.0.1:19000:9090"
+
+  worker:
+    image: public.ecr.aws/lambda/provided:al2023
+    # The image starts the runtime interface emulator, which starts
+    # /var/runtime/bootstrap for each invocation, as Lambda does.
+    command: bootstrap
+    volumes:
+      - ../../dist/local/bootstrap:/var/runtime/bootstrap:ro
+      # The worker looks for ffmpeg and ffprobe in "bin" beside itself, which
+      # is where the release zip has them.
+      - ../../dist/ffmpeg:/var/runtime/bin:ro
+    environment:
+      AWS_LAMBDA_FUNCTION_TIMEOUT: "30"
+      AWS_LAMBDA_FUNCTION_MEMORY_SIZE: "2048"
+      AWS_REGION: us-east-2
+      AWS_ACCESS_KEY_ID: local-access-key
+      AWS_SECRET_ACCESS_KEY: local-secret-key
+      AWS_ENDPOINT_URL_S3: http://s3:9090
+      # S3Mock answers on path-style requests only.
+      HAZMAT_S3_PATH_STYLE: "true"
+      HAZMAT_ALLOWED_BUCKETS: cdn
+      HAZMAT_INPUT_PREFIXES: uploads/
+      HAZMAT_OUTPUT_PREFIXES: uploads/
+      HAZMAT_MAX_PHOTO_BYTES: 1MiB
+      HAZMAT_VIDEO_CONTAINERS: mp4
+      HAZMAT_MAX_VIDEO_BYTES: 2MiB
+    depends_on:
+      - s3
+    ports:
+      - "127.0.0.1:19001:8080"
