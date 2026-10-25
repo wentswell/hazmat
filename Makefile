@@ -21,6 +21,7 @@ fuzz:
 	go test ./internal/photo -run '^$$' -fuzz '^FuzzScan$$' -fuzztime $(FUZZTIME)
 	go test ./internal/photo -run '^$$' -fuzz '^FuzzProcess$$' -fuzztime $(FUZZTIME)
 	go test ./internal/video -run '^$$' -fuzz '^FuzzProbeAndPackets$$' -fuzztime $(FUZZTIME)
+	go test ./internal/video -run '^$$' -fuzz '^FuzzShowinfoTimes$$' -fuzztime $(FUZZTIME)
 
 .PHONY: bench
 bench:

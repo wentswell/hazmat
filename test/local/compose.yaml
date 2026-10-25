@@ -10,7 +10,9 @@ services:
       - "127.0.0.1:19000:9090"
 
   worker:
-    image: public.ecr.aws/lambda/provided:al2023
+    # Pinned by digest, as the S3 double is: a new runtime image must not
+    # change a result without a change here.
+    image: public.ecr.aws/lambda/provided:al2023@sha256:612c98f126c2a95e77a016d56fed50a83055e11d636132ee6ebdd461f01b9617
     # The image starts the runtime interface emulator, which starts
     # /var/runtime/bootstrap for each invocation, as Lambda does.
     command: bootstrap
@@ -32,7 +34,6 @@ services:
       HAZMAT_INPUT_PREFIXES: uploads/
       HAZMAT_OUTPUT_PREFIXES: uploads/
       HAZMAT_MAX_PHOTO_BYTES: 1MiB
-      HAZMAT_VIDEO_CONTAINERS: mp4
       HAZMAT_MAX_VIDEO_BYTES: 2MiB
     depends_on:
       - s3

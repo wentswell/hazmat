@@ -346,13 +346,15 @@ func TestVideoThroughLambdaAndS3(t *testing.T) {
 		math.Abs(m.DurationS-4) > 0.05 || math.Abs(m.DeclaredDurationS-4) > 0.1 || m.FPS != 30 || m.Rotation != 0 || !m.HasAudio {
 		t.Errorf("media facts: %+v", m)
 	}
-	// Five frames of 4 s: one at the middle of each 0.8 s.
+	// Five frames of 4 s: one at the middle of each 0.8 s. At 30 frames a
+	// second each middle is the time of a frame, and that frame is the one
+	// taken.
 	if len(resp.Outputs) != 5 {
 		t.Fatalf("outputs: %+v", resp.Outputs)
 	}
 	for i, o := range resp.Outputs {
 		want := 0.4 + 0.8*float64(i)
-		if o.Name != fmt.Sprintf("frame_%02d", i+1) || o.TimeS == nil || math.Abs(*o.TimeS-want) > 0.04 {
+		if o.Name != fmt.Sprintf("frame_%02d", i+1) || o.TimeS == nil || math.Abs(*o.TimeS-want) > 0.001 {
 			t.Errorf("frame %d: name %s time %v, want about %.2f", i+1, o.Name, o.TimeS, want)
 		}
 		if o.Width != 320 || o.Height != 240 || o.Luma < 20 || o.Luma > 235 || o.Sharpness < 10 {
@@ -379,7 +381,7 @@ func TestVideoSamplingAndShape(t *testing.T) {
 	// One frame for each second of a 4 s video.
 	video["frames"] = map[string]any{"every_seconds": 1}
 	resp := invokeVideo(t, "every", fixture(t, "good.mp4"))
-	if resp.Status != "ok" || len(resp.Outputs) != 4 || math.Abs(*resp.Outputs[3].TimeS-3.5) > 0.04 {
+	if resp.Status != "ok" || len(resp.Outputs) != 4 || math.Abs(*resp.Outputs[3].TimeS-3.5) > 0.001 {
 		t.Errorf("each second: %s, %d frames, %+v", resp.Status, len(resp.Outputs), resp.Refusal)
 	}
 	video["frames"] = map[string]any{"count": 5}
@@ -406,6 +408,48 @@ func TestVideoSamplingAndShape(t *testing.T) {
 	}
 }
 
+// The times of the frames are the times of the file, measured, whatever the
+// file starts at or says in its tags. Each case is good.mp4 changed in its
+// container only, so its frames are the same pictures at the same times.
+func TestVideoTimesAreMeasured(t *testing.T) {
+	setup(t)
+	want := invokeVideo(t, "good", fixture(t, "good.mp4"))
+	if want.Status != "ok" || len(want.Outputs) != 5 {
+		t.Fatalf("good.mp4: %+v", want)
+	}
+	for _, name := range []string{
+		"shifted", // the packets start at 5 s
+		"tagged",  // the tags hold lines like the frame lines of ffmpeg
+	} {
+		resp := invokeVideo(t, name, fixture(t, name+".mp4"))
+		if resp.Status != "ok" || len(resp.Outputs) != len(want.Outputs) {
+			t.Errorf("%s: status %q, %d frames, refusal %+v (error %s %s)", name, resp.Status, len(resp.Outputs), resp.Refusal, resp.ErrorType, resp.ErrorMessage)
+			continue
+		}
+		if math.Abs(resp.Media.DurationS-want.Media.DurationS) > 0.001 {
+			t.Errorf("%s: duration %v, want %v", name, resp.Media.DurationS, want.Media.DurationS)
+		}
+		for i, o := range resp.Outputs {
+			w := want.Outputs[i]
+			if o.TimeS == nil || *o.TimeS != *w.TimeS {
+				t.Errorf("%s: frame %d at %v, want %v", name, i+1, o.TimeS, *w.TimeS)
+			}
+			if o.SHA256 != w.SHA256 {
+				t.Errorf("%s: frame %d is not the picture of good.mp4 at that time", name, i+1)
+			}
+		}
+	}
+}
+
+// QuickTime is a container of the default configuration.
+func TestQuickTimeThroughLambda(t *testing.T) {
+	setup(t)
+	resp := invokeVideo(t, "quicktime", fixture(t, "quicktime.mov"))
+	if resp.Status != "ok" || resp.Media.Container != "mov" || len(resp.Outputs) != 5 {
+		t.Errorf("quicktime: %s %+v %+v (error %s %s)", resp.Status, resp.Media, resp.Refusal, resp.ErrorType, resp.ErrorMessage)
+	}
+}
+
 func TestVideoRefusals(t *testing.T) {
 	setup(t)
 	good := fixture(t, "good.mp4")
@@ -414,7 +458,6 @@ func TestVideoRefusals(t *testing.T) {
 		data       []byte
 	}{
 		{"hevc", "unsupported_codec", fixture(t, "hevc.mp4")},
-		{"quicktime", "unsupported_container", fixture(t, "quicktime.mov")},
 		{"twovideo", "bad_stream_layout", fixture(t, "twovideo.mp4")},
 		{"audioonly", "bad_stream_layout", fixture(t, "audioonly.mp4")},
 		{"fast", "bad_stream_layout", fixture(t, "fast.mp4")},
@@ -430,6 +473,9 @@ func TestVideoRefusals(t *testing.T) {
 		{"half-no-index", "undecodable", fixture(t, "rotated.mp4")[:40000]},
 		{"header-only", "undecodable", append(append([]byte{}, good[:32]...), make([]byte, 4096)...)},
 		{"large", "too_many_bytes", append(append([]byte{}, good...), make([]byte, 2<<20)...)},
+		// The tags that ffmpeg prints push its frame lines past the part of
+		// the log the worker keeps, so the time of a frame is not known.
+		{"manytags", "undecodable", fixture(t, "manytags.mp4")},
 	}
 	for _, c := range cases {
 		resp := invokeVideo(t, c.name, c.data)

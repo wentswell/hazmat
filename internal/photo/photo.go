@@ -4,7 +4,7 @@ package photo
 
 import (
 	"bytes"
-	"fmt"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -75,7 +75,17 @@ func Process(src []byte, t sniff.Type, opts Options) (res *Result, err error) {
 	if pixels := int64(cfg.Width) * int64(cfg.Height); pixels > opts.MaxPixels {
 		return nil, contract.Refuse(contract.TooManyPixels, "%d x %d is %d pixels, limit %d", cfg.Width, cfg.Height, pixels, opts.MaxPixels)
 	}
-	img, err := decode(bytes.NewReader(src))
+	// The pixel ceiling bounds the memory of a decode, not its time: each
+	// scan of a progressive JPEG walks the whole picture again, and one scan
+	// can be a few bytes. So the scans are counted as the decoder reads them.
+	var r io.Reader = bytes.NewReader(src)
+	if t == sniff.JPEG {
+		r = &scanLimit{r: r}
+	}
+	img, err := decode(r)
+	if errors.Is(err, errTooManyScans) {
+		return nil, contract.Refuse(contract.Undecodable, "the JPEG has more than %d scans", maxJPEGScans)
+	}
 	if err != nil {
 		return nil, contract.Refuse(contract.Undecodable, "the %s data cannot be decoded: %v", t.Short(), err)
 	}
@@ -112,7 +122,7 @@ func Process(src []byte, t sniff.Type, opts Options) (res *Result, err error) {
 		out := orient(canvas, m.orientation)
 		var buf bytes.Buffer
 		if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: r.Quality}); err != nil {
-			return nil, fmt.Errorf("encode rendition %q: %w", r.Name, err)
+			return nil, contract.Fail("encode rendition %q: %w", r.Name, err)
 		}
 		res.Outputs[i] = Output{
 			Name:   r.Name,
@@ -135,6 +145,48 @@ func decoders(t sniff.Type) (func(io.Reader) (image.Config, error), func(io.Read
 		return webp.DecodeConfig, webp.Decode, true
 	}
 	return nil, nil, false
+}
+
+// maxJPEGScans is the most start-of-scan markers a JPEG may have. An encoder
+// makes 10 for a progressive color picture and 6 for a gray one; libjpeg
+// accepts a script of at most 100. Decode time grows with each scan, so a
+// file above this wants the time, not the picture.
+const maxJPEGScans = 100
+
+var errTooManyScans = errors.New("too many scans")
+
+// scanLimit counts the start-of-scan markers (0xFF 0xDA) in the bytes the
+// decoder reads, and fails the read after maxJPEGScans of them. It counts
+// what the decoder reads, not what a walk of the markers finds, so bytes
+// between the segments, which the decoder skips, cannot hide a scan. In the
+// entropy-coded data a 0xFF is always followed by 0x00 or a restart marker,
+// so a count there is a real scan. A pair inside a metadata segment counts
+// too, which only moves the limit a little.
+type scanLimit struct {
+	r     io.Reader
+	scans int
+	ff    bool // the last byte read was 0xFF
+	err   error
+}
+
+func (s *scanLimit) Read(p []byte) (int, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	n, err := s.r.Read(p)
+	for i, b := range p[:n] {
+		if s.ff && b == 0xDA {
+			if s.scans++; s.scans > maxJPEGScans {
+				// Give the decoder nothing of this scan, and fail every
+				// read after it: a short read that also returns an error
+				// can be taken as a full one.
+				s.err = errTooManyScans
+				return i, s.err
+			}
+		}
+		s.ff = b == 0xFF
+	}
+	return n, err
 }
 
 // render draws img onto an opaque RGBA canvas whose long edge is maxEdge at

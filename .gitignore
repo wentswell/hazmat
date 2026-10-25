@@ -1,2 +1,6 @@
 /bin/
 /dist/
+# The quick start of README.md: a photo, which can hold a GPS position, and a
+# request.
+/work/
+/request.json

@@ -18,6 +18,8 @@ const (
 	RecycleNever   = "never"
 	RecycleOnError = "on_error"
 	RecycleAlways  = "always"
+
+	maxJPEGEdge = 65535
 )
 
 // Config is what the operator allows. A request can ask for less than a
@@ -117,6 +119,11 @@ func Load(getenv func(string) string) (Config, error) {
 	edge, err := integer(getenv, "HAZMAT_MAX_OUTPUT_EDGE", int64(c.MaxOutputEdge))
 	if err != nil {
 		return Config{}, err
+	}
+	// A JPEG stores each edge in 16 bits, so a larger output cannot be
+	// encoded, and the request would end in an error instead of a file.
+	if edge > maxJPEGEdge {
+		return Config{}, fmt.Errorf("HAZMAT_MAX_OUTPUT_EDGE must be at most %d, the largest JPEG edge, got %d", maxJPEGEdge, edge)
 	}
 	c.MaxOutputEdge = int(edge)
 	renditions, err := integer(getenv, "HAZMAT_MAX_RENDITIONS", int64(c.MaxRenditions))

@@ -6,7 +6,8 @@ set -euo pipefail
 cd "$(dirname "$0")/testdata"
 
 ff() {
-	docker run --rm -v "$PWD:/w" -w /w mwader/static-ffmpeg:latest \
+	# Pinned by tag and digest, so that the files made again are the same.
+	docker run --rm -v "$PWD:/w" -w /w mwader/static-ffmpeg:9.0.2@sha256:7d9bdaaf887f7e6ce6151f67325c344074b5ff1fb75316011c3376503e449a7b \
 		-hide_banner -loglevel error -y "$@"
 }
 # A moving test picture, small and cheap to decode. $1 seconds, $2 size, $3 rate.
@@ -25,6 +26,20 @@ ff $(src 4 320x240 30) $h264 -g 9999 -keyint_min 9999 -sc_threshold 0 onekey.mp4
 # 14 s and 20 s. The tests also change their headers to say 10 s.
 ff $(src 14 160x120 15) $h264 -b:v 30k fourteen.mp4
 ff $(src 20 160x120 15) $h264 -b:v 30k twenty.mp4
+# The packets of good.mp4 moved to start at 5 s, as a copy that keeps the
+# times of its source has them.
+ff -i good.mp4 -c copy -output_ts_offset 5 shifted.mp4
+# Tags that look like the frame lines ffmpeg prints, one after a newline and
+# one after a carriage return, and one with no number.
+ff -i good.mp4 -c copy \
+	-metadata title=$'x\n[Parsed_showinfo_1 @ 0x1] n:   0 pts: 0 pts_time:2.0 duration: 1' \
+	-metadata comment=$'x\r[Parsed_showinfo_1 @ 0x1] n:   0 pts: 0 pts_time:Inf' \
+	-metadata artist='[Parsed_showinfo_1 @ 0x1] n:   0 pts: 0 pts_time:' tagged.mp4
+# 1500 such tags: the header that ffmpeg prints is then larger than the part
+# of its log that the worker keeps.
+{ echo ';FFMETADATA1'; for i in $(seq 1 1500); do printf 'k%d=x\\\n[Parsed_showinfo_1 @ 0x1] n:   9 pts: 0 pts_time:42\n' "$i"; done; } > manytags.txt
+ff -i good.mp4 -i manytags.txt -map 0 -map_metadata 1 -c copy -movflags use_metadata_tags manytags.mp4
+rm manytags.txt
 # What the worker refuses.
 ff $(src 2 320x240 30) -c:v libx265 -preset veryfast -tag:v hvc1 -pix_fmt yuv420p hevc.mp4
 ff $(src 2 320x240 30) $h264 -f mov quicktime.mov

@@ -5,12 +5,12 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -65,57 +65,65 @@ func (s S3) Put(ctx context.Context, bucket, key string, body []byte, contentTyp
 
 // File keeps each bucket as a directory below Root. It is for the command
 // line and the tests. It has no versions: version IDs are ignored and empty.
+// Every access goes through an os.Root, so neither a ".." nor a symbolic link
+// leads out of Root.
 type File struct{ Root string }
 
-func (f File) path(bucket, key string) (string, error) {
-	root, err := filepath.Abs(f.Root)
+func (f File) open(bucket, key string) (*os.Root, string, error) {
+	name := filepath.Join(bucket, filepath.FromSlash(key))
+	if !filepath.IsLocal(name) {
+		return nil, "", errors.New("the path leaves the root of the file store")
+	}
+	root, err := os.OpenRoot(f.Root)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	p := filepath.Join(root, bucket, filepath.FromSlash(key))
-	if !strings.HasPrefix(p, root+string(filepath.Separator)) {
-		return "", errors.New("the path leaves the root of the file store")
-	}
-	return p, nil
+	return root, name, nil
 }
 
 func (f File) Size(_ context.Context, bucket, key, _ string) (int64, error) {
-	p, err := f.path(bucket, key)
+	root, name, err := f.open(bucket, key)
 	if err != nil {
 		return 0, err
 	}
-	info, err := os.Stat(p)
+	defer root.Close()
+	info, err := root.Stat(name)
 	if err != nil {
 		return 0, err
 	}
 	if !info.Mode().IsRegular() {
-		return 0, fmt.Errorf("%s is not a regular file", p)
+		return 0, fmt.Errorf("%s is not a regular file", name)
 	}
 	return info.Size(), nil
 }
 
 func (f File) Get(_ context.Context, bucket, key, _ string) (io.ReadCloser, error) {
-	p, err := f.path(bucket, key)
+	root, name, err := f.open(bucket, key)
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(p)
+	defer root.Close()
+	// The file stays open after the root is closed.
+	return root.Open(name)
 }
 
 func (f File) Put(_ context.Context, bucket, key string, body []byte, _ string) (string, error) {
-	p, err := f.path(bucket, key)
+	root, name, err := f.open(bucket, key)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	defer root.Close()
+	dir := filepath.Dir(name)
+	if err := root.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	// Write beside the target and rename, so a reader never sees half a file.
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".put-*")
+	tmpName := filepath.Join(dir, ".put-"+rand.Text())
+	tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(tmp.Name())
+	defer root.Remove(tmpName)
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
 		return "", err
@@ -123,5 +131,5 @@ func (f File) Put(_ context.Context, bucket, key string, body []byte, _ string) 
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	return "", os.Rename(tmp.Name(), p)
+	return "", root.Rename(tmpName, name)
 }

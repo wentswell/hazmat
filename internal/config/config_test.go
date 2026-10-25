@@ -76,6 +76,7 @@ func TestBadValuesStopTheStart(t *testing.T) {
 		{"HAZMAT_MAX_PHOTO_BYTES": "10MB"},
 		{"HAZMAT_MAX_PHOTO_PIXELS": "0"},
 		{"HAZMAT_MAX_OUTPUT_EDGE": "4k"},
+		{"HAZMAT_MAX_OUTPUT_EDGE": "65536"}, // a JPEG edge is 16 bits
 		{"HAZMAT_MAX_RENDITIONS": "1.5"},
 		{"HAZMAT_PHOTO_TYPES": "jpeg,heic"},
 		{"HAZMAT_LOG_LEVEL": "loud"},
@@ -129,6 +130,14 @@ func TestVideoCeilings(t *testing.T) {
 		if _, err := Load(with(bad)); err == nil {
 			t.Errorf("%v was accepted", bad)
 		}
+	}
+}
+
+// The largest edge a JPEG can store is the largest a request can ask for.
+func TestOutputEdgeCeiling(t *testing.T) {
+	c, err := Load(with(map[string]string{"HAZMAT_MAX_OUTPUT_EDGE": "65535"}))
+	if err != nil || c.MaxOutputEdge != 65535 {
+		t.Errorf("65535: %d %v", c.MaxOutputEdge, err)
 	}
 }
 

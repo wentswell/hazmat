@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -65,6 +66,96 @@ func TestFileStoreStaysBelowItsRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "x")); err == nil {
 		t.Error("a file exists outside the root")
+	}
+}
+
+// A symbolic link below the root does not lead out of it, for a read or a
+// write. A relative link that stays inside the root still works; an absolute
+// link is refused even when it points inside.
+func TestFileStoreFollowsNoLinkOut(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	root, outside := filepath.Join(base, "store"), filepath.Join(base, "outside")
+	for _, d := range []string{filepath.Join(root, "cdn", "inside"), outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	links := map[string]string{
+		filepath.Join(root, "cdn", "uploads"):      outside,                              // a directory out
+		filepath.Join(root, "cdn", "file"):         filepath.Join(outside, "secret"),     // a file out
+		filepath.Join(root, "cdn", "rel"):          "../../outside",                      // a relative one out
+		filepath.Join(root, "cdn", "absin"):        filepath.Join(root, "cdn", "inside"), // absolute: refused, even inside
+		filepath.Join(root, "cdn", "inside", "up"): "..",                                 // up, still inside
+		filepath.Join(root, "cdn", "alias"):        "inside",                             // inside
+	}
+	for link, target := range links {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := File{Root: root}
+
+	for _, key := range []string{"uploads/m1.jpg", "rel/m1.jpg", "uploads/new/dir/m1.jpg", "absin/m1.jpg"} {
+		if _, err := f.Put(ctx, "cdn", key, []byte("x"), ""); err == nil {
+			t.Errorf("a write through %s was accepted", key)
+		}
+	}
+	for _, key := range []string{"file", "uploads/secret", "rel/secret"} {
+		if _, err := f.Size(ctx, "cdn", key, ""); err == nil {
+			t.Errorf("the size of %s was read", key)
+		}
+		if r, err := f.Get(ctx, "cdn", key, ""); err == nil {
+			r.Close()
+			t.Errorf("%s was read", key)
+		}
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 1 {
+		t.Errorf("the outside directory has %d entries, want 1", len(entries))
+	}
+
+	// Links that stay inside the root.
+	if _, err := f.Put(ctx, "cdn", "alias/a.jpg", []byte("pixels"), ""); err != nil {
+		t.Fatalf("a write through a link inside the root: %v", err)
+	}
+	if n, err := f.Size(ctx, "cdn", "inside/up/inside/a.jpg", ""); err != nil || n != 6 {
+		t.Errorf("a read through a link up and inside the root: %d %v", n, err)
+	}
+	// A write onto a link replaces the link and leaves its target alone.
+	if _, err := f.Put(ctx, "cdn", "file", []byte("new"), ""); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(outside, "secret")); string(b) != "SECRET" {
+		t.Errorf("the target of a link was written: %q", b)
+	}
+}
+
+// The root itself can be a link (on macOS /tmp is one), or the top directory.
+func TestFileStoreRoots(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	if err := os.Mkdir(filepath.Join(base, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "real"), filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	f := File{Root: filepath.Join(base, "link")}
+	if _, err := f.Put(ctx, "cdn", "a/b.jpg", []byte("pixels"), ""); err != nil {
+		t.Fatalf("a root that is a link: %v", err)
+	}
+	abs, err := filepath.Abs(filepath.Join(base, "real", "cdn", "a", "b.jpg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := strings.TrimPrefix(filepath.ToSlash(abs), "/")
+	bucket, key, _ := strings.Cut(rel, "/")
+	if n, err := (File{Root: "/"}).Size(ctx, bucket, key, ""); err != nil || n != 6 {
+		t.Errorf("the root /: %d %v", n, err)
 	}
 }
 

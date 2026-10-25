@@ -11,10 +11,15 @@ mkdir -p "$dir/go"
 cp "$(go env GOROOT)/LICENSE" "$dir/go/"
 
 go mod download
-go list -deps -tags lambda.norpc \
+# Not in a pipe: the status of a pipe is the status of its last command, so a
+# failed go list would give an empty list and a zip with no module license.
+mods=$(go list -deps -tags lambda.norpc \
 	-f '{{with .Module}}{{if not .Main}}{{.Path}} {{.Dir}}{{end}}{{end}}' \
-	./cmd/hazmat | sort -u |
-while read -r path moddir; do
+	./cmd/hazmat)
+mods=$(printf '%s\n' "$mods" | sort -u)
+[ -n "$mods" ] || { echo "collect-licenses: go list named no module" >&2; exit 1; }
+
+printf '%s\n' "$mods" | while read -r path moddir; do
 	found=
 	for f in "$moddir"/LICENSE* "$moddir"/LICENCE* "$moddir"/COPYING* "$moddir"/NOTICE*; do
 		[ -f "$f" ] || continue

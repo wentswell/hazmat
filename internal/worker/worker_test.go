@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -248,6 +249,9 @@ func TestRecycle(t *testing.T) {
 		{"a timeout, never", config.RecycleNever, "sleep 30", contract.DecodeTimeout, 0},
 		{"a signal, on_error", config.RecycleOnError, "kill -SEGV $$", contract.Undecodable, 1},
 		{"a file ffprobe cannot read, on_error", config.RecycleOnError, "exit 1", contract.Undecodable, 0},
+		{"a file ffprobe cannot read, always", config.RecycleAlways, "exit 1", contract.Undecodable, 1},
+		{"a file ffprobe cannot read, never", config.RecycleNever, "exit 1", contract.Undecodable, 0},
+		{"a bad stream layout, always", config.RecycleAlways, `echo '{"streams":[]}'`, contract.BadStreamLayout, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -271,5 +275,46 @@ func TestRecycle(t *testing.T) {
 				t.Errorf("work directories remain: %v", left)
 			}
 		})
+	}
+}
+
+// "always" is about the video tools: a photo, which no child process reads,
+// does not end the execution environment, and nor does a refused photo.
+func TestRecycleAlwaysSkipsPhotos(t *testing.T) {
+	for name, src := range map[string][]byte{"a photo": jpegOf(200, 100), "a refused photo": []byte("\xff\xd8\xff\xe0 not a jpeg")} {
+		f := newFixture(t)
+		recycled := 0
+		f.w.Recycle = func() { recycled++ }
+		f.w.Tools = &video.Tools{FFprobe: tool(t, "exit 1"), FFmpeg: tool(t, "exit 1")}
+		f.w.Config.Recycle = config.RecycleAlways
+		if _, err := f.w.Process(context.Background(), f.upload(src)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if recycled != 0 {
+			t.Errorf("%s: recycle was called %d times", name, recycled)
+		}
+	}
+}
+
+// A failure of the worker itself is a typed function error: the Lambda
+// errorType is the name of the type the error points to.
+func TestWorkerErrorIsTyped(t *testing.T) {
+	f := newFixture(t)
+	f.w.Tools = &video.Tools{FFprobe: "/no/such/ffprobe", FFmpeg: "/no/such/ffmpeg"}
+	f.w.Config.VideoContainers = []string{"mp4"}
+	f.w.Config.VideoCodecs = []string{"h264"}
+	f.w.Config.DecodeTimeoutSeconds = 5
+	req := f.upload(ftyp("mp42"))
+	req.Expect = contract.KindVideo
+	_, err := f.w.Process(context.Background(), req)
+	var failed *contract.WorkerError
+	if !errors.As(err, &failed) {
+		t.Fatalf("want a WorkerError, got %T %v", err, err)
+	}
+	if name := reflect.TypeOf(err).Elem().Name(); name != "WorkerError" {
+		t.Errorf("the errorType would be %q", name)
+	}
+	if !strings.Contains(f.logs.String(), `"result":"worker_error"`) {
+		t.Errorf("log: %s", f.logs)
 	}
 }

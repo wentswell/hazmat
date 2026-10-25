@@ -10,8 +10,11 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"os"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/wentswell/hazmat/internal/contract"
 	"github.com/wentswell/hazmat/internal/sniff"
@@ -121,16 +124,32 @@ func exifSegment(orientation int, gps bool) []byte {
 	return segment(0xE1, append([]byte("Exif\x00\x00"), tiff(orientation, gps)...))
 }
 
-// profile is a block with the header fields of an ICC profile that the worker
-// reads, and recognizable bytes after them.
+// profile is an ICC profile of size bytes with the structure the worker
+// checks: the header, a tag table, and the six tags of an RGB matrix profile.
+// The bytes after the tags are recognizable.
 func profile(space string, size int) []byte {
+	return iccProfile(space, size, "rXYZ", "gXYZ", "bXYZ", "rTRC", "gTRC", "bTRC")
+}
+
+func iccProfile(space string, size int, sigs ...string) []byte {
 	p := make([]byte, size)
 	for i := range p {
 		p[i] = byte(i * 7)
 	}
 	binary.BigEndian.PutUint32(p, uint32(size))
+	copy(p[12:], "mntr")
 	copy(p[16:], space)
+	copy(p[20:], "XYZ ")
 	copy(p[36:], "acsp")
+	binary.BigEndian.PutUint32(p[128:], uint32(len(sigs)))
+	data := 132 + 12*len(sigs)
+	for i, sig := range sigs {
+		e := p[132+12*i:]
+		copy(e, sig)
+		binary.BigEndian.PutUint32(e[4:], uint32(data+20*i))
+		binary.BigEndian.PutUint32(e[8:], 20)
+		copy(p[data+20*i:], "XYZ \x00\x00\x00\x00")
+	}
 	return p
 }
 
@@ -474,7 +493,7 @@ func TestParseTIFF(t *testing.T) {
 func FuzzScan(f *testing.F) {
 	jpg := []byte{0xFF, 0xD8}
 	jpg = append(jpg, exifSegment(6, true)...)
-	jpg = append(jpg, iccSegments(profile("RGB ", 300))[0]...)
+	jpg = append(jpg, iccSegments(profile("RGB ", 400))[0]...)
 	f.Add(jpg)
 	f.Add(append([]byte("\x89PNG\r\n\x1a\n"), pngChunk("eXIf", tiff(3, false))...))
 	f.Add([]byte("RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
@@ -486,6 +505,11 @@ func FuzzScan(f *testing.F) {
 			}
 			if len(m.icc) > maxICC {
 				t.Fatalf("a profile of %d bytes", len(m.icc))
+			}
+			// A profile that comes out is one the check accepts as it is,
+			// and holds exactly the size its header declares.
+			if m.icc != nil && (!bytes.Equal(rgbProfile(m.icc), m.icc) || binary.BigEndian.Uint32(m.icc) != uint32(len(m.icc))) {
+				t.Fatalf("a profile that does not pass its own check")
 			}
 		}
 	})
@@ -500,6 +524,7 @@ func FuzzProcess(f *testing.F) {
 	buf.Reset()
 	png.Encode(&buf, quadrants(16, 12))
 	f.Add(buf.Bytes())
+	f.Add(progressiveJPEG(64, 64, maxJPEGScans+1))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		typ := sniff.Detect(b)
 		res, err := Process(b, typ, Options{
@@ -534,5 +559,171 @@ func BenchmarkPhone12MP(b *testing.B) {
 		if _, err := Process(src, sniff.JPEG, opts); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// The profile is the one part of the source an output carries, so it must be
+// a profile in structure, not a block with a few header bytes right.
+func TestRGBProfile(t *testing.T) {
+	set := func(p []byte, off int, v string) []byte { copy(p[off:], v); return p }
+	u32 := func(p []byte, off int, v uint32) []byte { binary.BigEndian.PutUint32(p[off:], v); return p }
+	valid := profile("RGB ", 548)
+	cases := []struct {
+		name string
+		icc  []byte
+		want []byte
+	}{
+		{"matrix profile", valid, valid},
+		{"lookup table profile", iccProfile("RGB ", 548, "A2B0", "desc"), iccProfile("RGB ", 548, "A2B0", "desc")},
+		{"Lab connection space", set(profile("RGB ", 548), 20, "Lab "), set(profile("RGB ", 548), 20, "Lab ")},
+		{"input class", set(profile("RGB ", 548), 12, "scnr"), set(profile("RGB ", 548), 12, "scnr")},
+		{"padding after the profile", append(append([]byte{}, valid...), 0, 0, 0, 0), valid},
+		{"declared size one more", u32(profile("RGB ", 548), 0, 549), nil},
+		{"declared size below the table", u32(profile("RGB ", 548), 0, 131), nil},
+		{"device link class", set(profile("RGB ", 548), 12, "link"), nil},
+		{"named color class", set(profile("RGB ", 548), 12, "nmcl"), nil},
+		{"connection space not XYZ or Lab", set(profile("RGB ", 548), 20, "RGB "), nil},
+		{"no signature", set(profile("RGB ", 548), 36, "xxxx"), nil},
+		{"CMYK", profile("CMYK", 548), nil},
+		{"gray", profile("GRAY", 548), nil},
+		{"no tags", u32(profile("RGB ", 548), 128, 0), nil},
+		{"more tags than the ceiling", u32(profile("RGB ", 548), 128, maxICCTags+1), nil},
+		{"tag table past the end", u32(profile("RGB ", 548), 128, 40), nil},
+		{"tag past the end", u32(profile("RGB ", 548), 132+8, 1000), nil},
+		{"tag offset past four gigabytes", u32(u32(profile("RGB ", 548), 132+4, 0xFFFFFFF0), 132+8, 0x20), nil},
+		{"tag inside the table", u32(profile("RGB ", 548), 132+4, 132), nil},
+		{"tag smaller than its type", u32(profile("RGB ", 548), 132+8, 4), nil},
+		{"one curve missing", iccProfile("RGB ", 548, "rXYZ", "gXYZ", "bXYZ", "rTRC", "gTRC"), nil},
+		{"only text tags", iccProfile("RGB ", 548, "desc", "cprt"), nil},
+		{"above 256 KiB", profile("RGB ", 256<<10+1), nil},
+		{"256 KiB", profile("RGB ", 256<<10), profile("RGB ", 256<<10)},
+		{"shorter than a header", valid[:131], nil},
+		{"the old fake header", func() []byte {
+			p := bytes.Repeat([]byte("Exif GPS 51.5N"), 40)
+			return set(set(p, 16, "RGB "), 36, "acsp")
+		}(), nil},
+	}
+	for _, c := range cases {
+		if got := rgbProfile(c.icc); !bytes.Equal(got, c.want) || (got == nil) != (c.want == nil) {
+			t.Errorf("%s: got %d bytes, want %d", c.name, len(got), len(c.want))
+		}
+	}
+}
+
+// A block that has only the bytes the old check read reaches no output.
+func TestFakeProfileIsDropped(t *testing.T) {
+	fake := bytes.Repeat([]byte("Exif GPS 51.5N "), 300)
+	binary.BigEndian.PutUint32(fake, uint32(len(fake)))
+	copy(fake[16:], "RGB ")
+	copy(fake[36:], "acsp")
+	res := process(t, withSegments(encodeJPEG(t, quadrants(64, 48)), iccSegments(fake)...), one)
+	out := res.Outputs[0].Data
+	if bytes.Contains(out, []byte("ICC_PROFILE")) || bytes.Contains(out, []byte("GPS 51.5N")) {
+		t.Error("the output carries the fake profile")
+	}
+	decodeOutput(t, res.Outputs[0])
+}
+
+// progressiveJPEG is a gray w x h progressive JPEG with the given count of AC
+// refinement scans. One scan is a few bytes: a symbol that ends the bands of
+// 16384 blocks. The decoder still walks every coefficient of every block.
+func progressiveJPEG(w, h, scans int) []byte {
+	b := []byte{0xFF, 0xD8}
+	b = append(b, segment(0xDB, append([]byte{0x00}, bytes.Repeat([]byte{1}, 64)...))...) // DQT
+	sof := []byte{8}
+	sof = binary.BigEndian.AppendUint16(sof, uint16(h))
+	sof = binary.BigEndian.AppendUint16(sof, uint16(w))
+	sof = append(sof, 1, 1, 0x11, 0)
+	b = append(b, segment(0xC2, sof)...) // SOF2, one component
+	dht := append([]byte{0x10, 1}, make([]byte, 15)...)
+	b = append(b, segment(0xC4, append(dht, 0xE0))...) // AC table: one code, symbol 0xE0
+	blocks := ((w + 7) / 8) * ((h + 7) / 8)
+	symbols := (blocks + 16383) / 16384
+	data := make([]byte, (symbols*15+7)/8)
+	sos := segment(0xDA, []byte{1, 1, 0x00, 1, 63, 0x10}) // Ss=1 Se=63 Ah=1 Al=0
+	for i := 0; i < scans; i++ {
+		b = append(b, sos...)
+		b = append(b, data...)
+	}
+	return append(b, 0xFF, 0xD9)
+}
+
+func TestProgressiveScans(t *testing.T) {
+	small := []contract.Rendition{{Name: "s", MaxEdge: 64, Quality: 80}}
+	run := func(src []byte) (*Result, error, time.Duration) {
+		start := time.Now()
+		res, err := Process(src, sniff.JPEG, Options{Renditions: small, MaxPixels: 50_000_000})
+		return res, err, time.Since(start)
+	}
+	// A real encoder makes about 10 scans, and libjpeg accepts 100.
+	for _, n := range []int{1, 10, maxJPEGScans} {
+		if _, err, _ := run(progressiveJPEG(256, 256, n)); err != nil {
+			t.Errorf("%d scans: %v", n, err)
+		}
+	}
+	if _, err, _ := run(progressiveJPEG(256, 256, maxJPEGScans+1)); err == nil {
+		t.Errorf("%d scans were accepted", maxJPEGScans+1)
+	} else {
+		wantRefusal(t, err, contract.Undecodable)
+	}
+
+	// 400 scans of a 16-megapixel picture took 6 s and were accepted. Now
+	// the decoder stops at the limit, so the time of a refusal does not grow
+	// with the scans after it.
+	_, err, atLimit := run(progressiveJPEG(1024, 1024, maxJPEGScans+1))
+	wantRefusal(t, err, contract.Undecodable)
+	_, err, far := run(progressiveJPEG(1024, 1024, 20*maxJPEGScans))
+	wantRefusal(t, err, contract.Undecodable)
+	if far > 3*atLimit+100*time.Millisecond {
+		t.Errorf("%d scans took %v to refuse, %d took %v", 20*maxJPEGScans, far, maxJPEGScans+1, atLimit)
+	}
+
+	// The decoder skips bytes between segments, so a junk byte before each
+	// scan must not hide it.
+	src := progressiveJPEG(256, 256, maxJPEGScans+1)
+	junk := bytes.ReplaceAll(src, []byte{0xFF, 0xDA}, []byte{'A', 0xFF, 0xDA})
+	_, err, _ = run(junk)
+	wantRefusal(t, err, contract.Undecodable)
+	// Fill bytes before the marker.
+	_, err, _ = run(bytes.ReplaceAll(src, []byte{0xFF, 0xDA}, []byte{0xFF, 0xFF, 0xFF, 0xDA}))
+	wantRefusal(t, err, contract.Undecodable)
+
+	// An ordinary baseline file is not touched.
+	if _, err, _ := run(encodeJPEG(t, quadrants(64, 48))); err != nil {
+		t.Errorf("baseline: %v", err)
+	}
+}
+
+// The count does not depend on how the reads split the bytes.
+func TestScanLimitAcrossReads(t *testing.T) {
+	for _, n := range []int{maxJPEGScans, maxJPEGScans + 1} {
+		src := progressiveJPEG(64, 64, n)
+		s := &scanLimit{r: iotest.OneByteReader(bytes.NewReader(src))}
+		got, err := io.ReadAll(s)
+		if n <= maxJPEGScans && (err != nil || !bytes.Equal(got, src)) {
+			t.Errorf("%d scans: %v, read %d of %d bytes", n, err, len(got), len(src))
+		}
+		if n > maxJPEGScans && !errors.Is(err, errTooManyScans) {
+			t.Errorf("%d scans: %v", n, err)
+		}
+		if s.scans != min(n, maxJPEGScans+1) {
+			t.Errorf("%d scans counted as %d", n, s.scans)
+		}
+	}
+}
+
+// A JPEG edge is 16 bits. The configuration stops a larger max_edge at start;
+// below it, an image wider than that is made smaller and encodes. Above it,
+// the encoder fails, and that is an error of the worker, not of the file.
+func TestJPEGEdgeLimit(t *testing.T) {
+	src := encodePNG(t, image.NewRGBA(image.Rect(0, 0, 70000, 2)))
+	res, err := Process(src, sniff.PNG, Options{Renditions: []contract.Rendition{{Name: "w", MaxEdge: 65535, Quality: 80}}, MaxPixels: 1 << 20})
+	if err != nil || res.Outputs[0].Width != 65535 {
+		t.Fatalf("an edge of 65535: %v", err)
+	}
+	_, err = Process(src, sniff.PNG, Options{Renditions: []contract.Rendition{{Name: "w", MaxEdge: 70000, Quality: 80}}, MaxPixels: 1 << 20})
+	var failed *contract.WorkerError
+	if !errors.As(err, &failed) {
+		t.Errorf("an edge of 70000: want a WorkerError, got %T %v", err, err)
 	}
 }
