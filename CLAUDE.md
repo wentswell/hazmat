@@ -33,6 +33,7 @@ internal/store/      Store interface; S3 and File
 ffmpeg/              Dockerfile: the pinned, minimal ffmpeg and ffprobe
 test/local/          compose.yaml + integration tests (Lambda runtime image + S3Mock); testdata/ videos from make-fixtures.sh
 internal/worker/     one request end to end, and its one log line
+examples/            terraform-lambda: a deploy of the release zip; keep its env vars, IAM, and settings in step with README.md
 ```
 
 ## Build / test
