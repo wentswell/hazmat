@@ -55,6 +55,7 @@ After `terraform apply` in [`../terraform-lambda`](../terraform-lambda):
 ```sh
 export HAZMAT_BUCKET=$(terraform -chdir=../terraform-lambda output -raw bucket)
 export HAZMAT_FUNCTION=$(terraform -chdir=../terraform-lambda output -raw function_name)
+export HAZMAT_UPLOAD_PREFIX=$(terraform -chdir=../terraform-lambda output -raw upload_prefix)
 uv run caller.py photo.jpg
 ```
 

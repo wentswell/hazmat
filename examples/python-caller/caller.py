@@ -29,7 +29,9 @@ from botocore.exceptions import ClientError
 
 BUCKET = os.environ["HAZMAT_BUCKET"]
 FUNCTION = os.environ.get("HAZMAT_FUNCTION", "hazmat")
-PREFIX = "uploads/"  # The same prefix the function is allowed to use.
+# The prefix the function may use (HAZMAT_INPUT_PREFIXES and
+# HAZMAT_OUTPUT_PREFIXES, or upload_prefix in the Terraform example).
+PREFIX = os.environ.get("HAZMAT_UPLOAD_PREFIX", "uploads/")
 
 # The largest file the app may upload: the larger of HAZMAT_MAX_PHOTO_BYTES and
 # HAZMAT_MAX_VIDEO_BYTES. hazmat still checks the real limit for each kind.

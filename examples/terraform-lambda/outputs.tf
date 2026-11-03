@@ -13,6 +13,11 @@ output "bucket" {
   value       = aws_s3_bucket.uploads.id
 }
 
+output "upload_prefix" {
+  description = "The key prefix that hazmat may read from and write to."
+  value       = var.upload_prefix
+}
+
 output "invoke_policy_json" {
   description = "An IAM policy that lets your service invoke the function. Attach it to your service's role."
   value       = data.aws_iam_policy_document.invoke.json
