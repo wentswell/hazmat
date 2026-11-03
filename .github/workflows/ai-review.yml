@@ -183,8 +183,9 @@ jobs:
             - A contract or HAZMAT_* change that README.md does not match.
 
             This repository is public. Report any name of a deployment, a
-            bucket, an account, or an internal system in code, docs, or
-            examples.
+            bucket, a cloud account, or an internal system in code, docs, or
+            examples. The repository's own GitHub path is public and is not
+            a finding.
 
             Rules for your output:
             - Report only a fault you can name with a file and a line.
