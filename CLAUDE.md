@@ -33,6 +33,7 @@ internal/store/      Store interface; S3 and File
 ffmpeg/              Dockerfile: the pinned, minimal ffmpeg and ffprobe
 test/local/          compose.yaml + integration tests (Lambda runtime image + S3Mock); testdata/ videos from make-fixtures.sh
 internal/worker/     one request end to end, and its one log line
+examples/            terraform-lambda: a deploy of the release zip; python-caller: the API side (presign, version pin, invoke, result handling). Keep both in step with README.md and the contract; python-caller runs against the test/local stack (see its README)
 ```
 
 ## Build / test
@@ -42,3 +43,5 @@ internal/worker/     one request end to end, and its one log line
 ## CI / releases
 
 `.github/workflows/ci.yml`: every push to `main` that passes is a release (`vMAJOR.MINOR.PATCH`, `MAJOR.MINOR` from `VERSION`), with the Lambda zip and `checksums.txt`. CI runs on arm64 runners, because the zip holds ffmpeg for arm64; the ffmpeg build is cached on the hash of `ffmpeg/Dockerfile`. Bump `VERSION` for a contract change. The repo holds no AWS credentials; a deployment pins a tag and a sha256. The release also carries the FFmpeg source tarball and the zip carries `LICENSE`, `NOTICE`, `bin/COPYING.LGPLv2.1`, and `licenses/` (from `scripts/collect-licenses.sh`): that is the LGPL and Go-module license compliance, so keep it when changing `make dist` or the release step.
+
+`.github/workflows/ai-review.yml`: a Codex review when a pull request into `main` opens or is marked ready; comment `/ai-review` to run it again. It skips pull requests from forks, because a `/ai-review` would give the key to a job that reads the fork's code. Its prompt lists this file's rules: update it when they change.

@@ -344,6 +344,12 @@ or a location.
 
 ## Deploying on AWS Lambda
 
+Using Terraform? [`examples/terraform-lambda`](examples/terraform-lambda)
+sets up everything below for you: the bucket, the function, the role, and the
+log group. [`examples/python-caller`](examples/python-caller) shows the other
+half: the code in your API that takes an upload, calls hazmat, and handles each
+result.
+
 1. Download the zip and `checksums.txt` from a release, and verify the sha256.
 
 2. Create a function with these settings:
