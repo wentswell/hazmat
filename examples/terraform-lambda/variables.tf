@@ -19,9 +19,12 @@ variable "upload_prefix" {
   type        = string
   default     = "uploads/"
 
+  # Plain path segments only. The prefix goes into the IAM resource ARN, where
+  # "*" or "?" would grant more than the prefix. No segment starts with ".", so
+  # there is no "." or "..", which hazmat refuses in a key.
   validation {
-    condition     = endswith(var.upload_prefix, "/") && !startswith(var.upload_prefix, "/")
-    error_message = "upload_prefix must end with \"/\" and must not start with \"/\"."
+    condition     = can(regex("^([A-Za-z0-9_-][A-Za-z0-9._-]*/)+$", var.upload_prefix))
+    error_message = "upload_prefix must be one or more path segments of letters, digits, \".\", \"_\" or \"-\", each ending with \"/\", for example \"uploads/\"."
   }
 }
 
