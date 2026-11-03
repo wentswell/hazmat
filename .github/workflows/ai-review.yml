@@ -1,0 +1,211 @@
+name: AI Review
+
+# The default for every job. The job that runs the model gets nothing beyond
+# this: it cannot write to the pull request. Only the `post` job can.
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, ready_for_review]
+  # The review runs once, when the pull request opens. To run it again after a
+  # push, comment `/ai-review` on the pull request.
+  issue_comment:
+    types: [created]
+
+# A second `/ai-review` on the same pull request replaces the first.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    # A comment event reaches this workflow for every issue in the repository.
+    # Act only on a pull request, and only on the command. The `auth` step
+    # below decides whether the commenter may run it.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null
+       && startsWith(github.event.comment.body, '/ai-review'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # To mark the command comment as seen. A comment on a pull request is an
+      # issue comment, but reacting to it needs `pull-requests: write`:
+      # `issues: write` alone returns 403 "Resource not accessible by
+      # integration". The model does not run here.
+      pull-requests: write
+      issues: write
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+    steps:
+      # A secret cannot be read from a job-level `if`, so the key is checked
+      # here and passed down as an output. The review then skips, rather than
+      # fails, until OPENAI_API_KEY is set.
+      - id: check
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_API_KEY is not set. Skipping the review."
+          fi
+
+      # `author_association` is affiliation, not access: an organization
+      # MEMBER, or a triage COLLABORATOR, can be read-only. Ask for the
+      # effective permission instead. `openai/codex-action` runs this same
+      # check on itself, so this one only stops the job earlier, before it
+      # takes a runner and marks the comment as seen.
+      - id: auth
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "issue_comment" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          level=$(gh api \
+            "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" \
+            --jq .permission 2>/dev/null || echo none)
+          case "$level" in
+            admin|maintain|write)
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::notice::$ACTOR has \"$level\" permission here. Skipping."
+              ;;
+          esac
+
+      # `pull_request` carries the two commits to compare. `issue_comment`
+      # carries neither, so read the pull request from the API for both. Apply
+      # the base-branch filter too, which the `pull_request` trigger applies on
+      # its own.
+      #
+      # This repository is public, so anyone can open a pull request from a
+      # fork. A fork's own `pull_request` event gets no secrets, but a
+      # `/ai-review` on it would give the key to a job that reads the fork's
+      # code. Review only branches of this repository.
+      - id: pr
+        if: steps.auth.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER")
+          ref=$(jq -r .base.ref <<< "$pr")
+          if [ "$ref" != "main" ]; then
+            echo "::notice::Pull request #$NUMBER targets $ref. Skipping."
+            exit 0
+          fi
+          # A deleted fork leaves head.repo null, which is not this repository.
+          head_repo=$(jq -r '.head.repo.full_name // ""' <<< "$pr")
+          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "::notice::Pull request #$NUMBER comes from a fork. Skipping."
+            exit 0
+          fi
+          jq -r '"number=\(.number)\nbase=\(.base.sha)\nhead=\(.head.sha)"' <<< "$pr" >> "$GITHUB_OUTPUT"
+
+      # Tell the author the command was heard. The review takes a few minutes.
+      # Never fail the job over it: this is cosmetic, and a 403 here used to
+      # take the whole review down with it, which made `/ai-review` a no-op.
+      - if: github.event_name == 'issue_comment' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api --silent -X POST \
+            "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes \
+            || echo "::warning::Could not react to the command comment. Continuing."
+
+  codex:
+    needs: preflight
+    # An unresolved pull request means the comment guard let the event through
+    # but the pull request was out of scope. Dependabot pull requests read a
+    # separate, empty secret store, so the key arrives blank on their own
+    # event; `/ai-review` on one still works, because that event is ours.
+    if: >-
+      needs.preflight.outputs.enabled == 'true'
+      && needs.preflight.outputs.number != ''
+      && (github.event_name != 'pull_request' || github.actor != 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    outputs:
+      review: ${{ steps.run_codex.outputs['final-message'] }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ needs.preflight.outputs.number }}/merge
+          # Keep the token out of .git/config. Codex reads files.
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Codex review
+        id: run_codex
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: gpt-5.6-sol
+          effort: medium
+          permission-profile: ":read-only"
+          prompt: |
+            Review this pull request for correctness and security faults.
+
+            Read CLAUDE.md first. It holds this repository's rules.
+            Then read the change:
+              git diff ${{ needs.preflight.outputs.base }}...${{ needs.preflight.outputs.head }}
+
+            This worker decodes files that an attacker controls. Look hardest
+            at these, which are the rules in CLAUDE.md that a change can break:
+            - A path that passes a file it did not fully decode, or lets a
+              byte of the source reach an output.
+            - Work, a download, or an allocation before the limit that
+              bounds it is checked.
+            - A bad file that becomes a function error, or a storage or
+              worker failure that becomes a refusal.
+            - A request above a ceiling that is lowered instead of refused.
+            - Metadata other than the RGB ICC profile copied to an output.
+            - Request or file data in an ffmpeg argument, or tool output in
+              a refusal detail or a log line.
+            - A log line with file bytes, EXIF values, or a position.
+            - A contract or HAZMAT_* change that README.md does not match.
+
+            This repository is public. Report any name of a deployment, a
+            bucket, an account, or an internal system in code, docs, or
+            examples.
+
+            Rules for your output:
+            - Report only a fault you can name with a file and a line.
+            - Do not report style. Do not restate the diff.
+            - Do not suggest a rewrite of code that already works.
+            - If you find nothing, say so in one line and stop.
+
+  post:
+    needs: [preflight, codex]
+    # An empty review posts nothing.
+    if: needs.codex.outputs.review != ''
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW: ${{ needs.codex.outputs.review }}
+          NUMBER: ${{ needs.preflight.outputs.number }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.NUMBER),
+              body: "## Codex review\n\n" + process.env.REVIEW,
+            });
