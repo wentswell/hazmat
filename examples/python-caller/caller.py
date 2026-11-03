@@ -129,10 +129,9 @@ def process(media_id: str, version_id: str) -> dict:
             InvocationType="RequestResponse",
             Payload=json.dumps(request).encode(),
         )
-    except Exception as e:  # Throttled, network down, and so on.
+        payload = json.loads(result["Payload"].read())
+    except Exception as e:  # Throttled, network down, a cut-off response.
         raise TryLater() from e
-
-    payload = json.loads(result["Payload"].read())
 
     # A function error: hazmat (or Lambda) failed, not the file. Lambda marks
     # it with FunctionError. The local Lambda emulator doesn't, so also look

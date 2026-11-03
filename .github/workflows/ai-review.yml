@@ -144,7 +144,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/pull/${{ needs.preflight.outputs.number }}/merge
+          # The head that preflight read, not the merge ref: a push after
+          # preflight must not change what is reviewed, and a pull request with
+          # a conflict has no merge ref. The prompt diffs base...head.
+          ref: ${{ needs.preflight.outputs.head }}
           # Keep the token out of .git/config. Codex reads files.
           persist-credentials: false
           fetch-depth: 0

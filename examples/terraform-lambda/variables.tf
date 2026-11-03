@@ -50,6 +50,12 @@ variable "decode_timeout_seconds" {
   description = "HAZMAT_DECODE_TIMEOUT_SECONDS: the time limit for all ffmpeg runs of one video."
   type        = number
   default     = 20
+
+  # hazmat refuses to start with anything else.
+  validation {
+    condition     = var.decode_timeout_seconds > 0 && floor(var.decode_timeout_seconds) == var.decode_timeout_seconds
+    error_message = "decode_timeout_seconds must be a positive whole number."
+  }
 }
 
 variable "timeout_seconds" {
