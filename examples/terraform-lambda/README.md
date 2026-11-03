@@ -108,6 +108,8 @@ terraform output -raw invoke_policy_json
 Your service invokes the function synchronously (`RequestResponse`) and handles
 each result as the "How to handle each result" table of the
 [top-level README](../../README.md#how-to-handle-each-result) says.
+[`../python-caller`](../python-caller) is a short, runnable example of that
+code.
 
 Your service also needs to put uploads into the bucket below the prefix (or
 hand out presigned upload URLs for it) and read the outputs. This example
