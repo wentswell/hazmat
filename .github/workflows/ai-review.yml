@@ -20,9 +20,14 @@ on:
   issue_comment:
     types: [created]
 
-# A second `/ai-review` on the same pull request replaces the first.
+# A second `/ai-review` on the same pull request replaces the first. Every
+# other comment on the pull request also starts this workflow (and is skipped
+# by `preflight`), so it goes in a group of its own: it must not cancel a
+# review that is running.
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: >-
+    ai-review-${{ github.event.pull_request.number || github.event.issue.number
+    }}-${{ github.event_name == 'pull_request' || startsWith(github.event.comment.body, '/ai-review') }}
   cancel-in-progress: true
 
 jobs:
@@ -35,9 +40,13 @@ jobs:
     # no review. A bot has no write access, which codex-action requires, and
     # Dependabot reads an empty secret store. A person can still comment
     # `/ai-review` on it.
+    #
+    # A draft starts no review when it opens. `ready_for_review` starts it,
+    # so a draft is reviewed once, when it is ready.
     if: >-
       (github.event_name == 'pull_request'
-       && github.event.pull_request.user.type != 'Bot') ||
+       && github.event.pull_request.user.type != 'Bot'
+       && !github.event.pull_request.draft) ||
       (github.event.issue.pull_request != null
        && startsWith(github.event.comment.body, '/ai-review'))
     runs-on: ubuntu-latest
@@ -235,6 +244,7 @@ jobs:
         env:
           REVIEW: ${{ needs.codex.outputs.review }}
           NUMBER: ${{ needs.preflight.outputs.number }}
+          BASE: ${{ needs.preflight.outputs.base }}
           HEAD: ${{ needs.preflight.outputs.head }}
         with:
           script: |
@@ -256,10 +266,13 @@ jobs:
             }
 
             // GitHub accepts an inline comment only on a line that the diff
-            // shows on its new side: an added line or a context line.
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner, repo, pull_number, per_page: 100,
+            // shows on its new side: an added line or a context line. Read
+            // the diff of the reviewed commits, not the pull request's current
+            // one: a push while Codex ran must not move the lines.
+            const { data: compare } = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${process.env.BASE}...${head}`,
             });
+            const files = compare.files || [];
             const commentable = new Map();
             for (const file of files) {
               const lines = new Set();
@@ -275,14 +288,22 @@ jobs:
               commentable.set(file.filename, lines);
             }
 
+            // Codex should give a repository path. Strip a diff prefix
+            // (`a/`, `b/`) only when the path as given is not in the diff and
+            // the stripped one is: `a/` can be a real directory.
+            const normalize = (path) => {
+              const p = path.replace(/^\.\//, "");
+              const bare = p.replace(/^[ab]\//, "");
+              return !commentable.has(p) && commentable.has(bare) ? bare : p;
+            };
             const label = (f) => `**${f.severity}: ${f.title}**`;
             const link = (f) =>
               `https://github.com/${owner}/${repo}/blob/${head}/${f.path}#L${f.line}`;
             const inline = [];
             const outside = [];
             for (const finding of review.findings) {
-              const path = finding.path.replace(/^(\.\/|[ab]\/)/, "");
-              const f = { ...finding, path };
+              const f = { ...finding, path: normalize(finding.path) };
+              const { path } = f;
               if (commentable.get(path)?.has(f.line)) {
                 inline.push({ path, line: f.line, side: "RIGHT", body: `${label(f)}\n\n${f.body}` });
               } else {
@@ -311,6 +332,6 @@ jobs:
               core.warning(`Inline review refused (${error.status}): ${error.message}`);
               await github.rest.pulls.createReview({
                 owner, repo, pull_number, commit_id: head, event: "COMMENT",
-                body: bodyFor(review.findings.map((f) => ({ ...f, path: f.path.replace(/^(\.\/|[ab]\/)/, "") }))),
+                body: bodyFor(review.findings.map((f) => ({ ...f, path: normalize(f.path) }))),
               });
             }
