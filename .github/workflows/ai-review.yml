@@ -20,16 +20,6 @@ on:
   issue_comment:
     types: [created]
 
-# A second `/ai-review` on the same pull request replaces the first. Every
-# other comment on the pull request also starts this workflow (and is skipped
-# by `preflight`), so it goes in a group of its own: it must not cancel a
-# review that is running.
-concurrency:
-  group: >-
-    ai-review-${{ github.event.pull_request.number || github.event.issue.number
-    }}-${{ github.event_name == 'pull_request' || startsWith(github.event.comment.body, '/ai-review') }}
-  cancel-in-progress: true
-
 jobs:
   preflight:
     # A comment event reaches this workflow for every issue in the repository.
@@ -158,6 +148,13 @@ jobs:
     if: >-
       needs.preflight.outputs.enabled == 'true'
       && needs.preflight.outputs.number != ''
+    # A second review of the same pull request replaces the first. The group
+    # is on this job, not on the workflow, so only a run that passed the
+    # `auth` check can join it. A workflow-level group would let anyone who
+    # can comment cancel a running review with `/ai-review`.
+    concurrency:
+      group: ai-review-${{ needs.preflight.outputs.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     outputs:
       review: ${{ steps.run_codex.outputs['final-message'] }}
