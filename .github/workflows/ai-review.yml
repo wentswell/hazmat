@@ -1,5 +1,11 @@
 name: AI Review
 
+# Codex reviews a pull request for correctness and security faults. The `post`
+# job turns its findings into one pull request review: each finding is an
+# inline comment on its line, so each one opens a review thread that can be
+# resolved. This file is the same in every repository that has it. What
+# differs per repository is in .github/ai-review-focus.md.
+#
 # The default for every job. The job that runs the model gets nothing beyond
 # this: it cannot write to the pull request. Only the `post` job can.
 permissions:
@@ -7,16 +13,21 @@ permissions:
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
     types: [opened, ready_for_review]
   # The review runs once, when the pull request opens. To run it again after a
   # push, comment `/ai-review` on the pull request.
   issue_comment:
     types: [created]
 
-# A second `/ai-review` on the same pull request replaces the first.
+# A second `/ai-review` on the same pull request replaces the first. Every
+# other comment on the pull request also starts this workflow (and is skipped
+# by `preflight`), so it goes in a group of its own: it must not cancel a
+# review that is running.
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: >-
+    ai-review-${{ github.event.pull_request.number || github.event.issue.number
+    }}-${{ github.event_name == 'pull_request' || startsWith(github.event.comment.body, '/ai-review') }}
   cancel-in-progress: true
 
 jobs:
@@ -24,8 +35,18 @@ jobs:
     # A comment event reaches this workflow for every issue in the repository.
     # Act only on a pull request, and only on the command. The `auth` step
     # below decides whether the commenter may run it.
+    #
+    # A pull request that a bot opens (Dependabot, a GitHub App) starts
+    # no review. A bot has no write access, which codex-action requires, and
+    # Dependabot reads an empty secret store. A person can still comment
+    # `/ai-review` on it.
+    #
+    # A draft starts no review when it opens. `ready_for_review` starts it,
+    # so a draft is reviewed once, when it is ready.
     if: >-
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request'
+       && github.event.pull_request.user.type != 'Bot'
+       && !github.event.pull_request.draft) ||
       (github.event.issue.pull_request != null
        && startsWith(github.event.comment.body, '/ai-review'))
     runs-on: ubuntu-latest
@@ -90,10 +111,9 @@ jobs:
       # the base-branch filter too, which the `pull_request` trigger applies on
       # its own.
       #
-      # This repository is public, so anyone can open a pull request from a
-      # fork. A fork's own `pull_request` event gets no secrets, but a
-      # `/ai-review` on it would give the key to a job that reads the fork's
-      # code. Review only branches of this repository.
+      # Review only branches of this repository. A fork's own `pull_request`
+      # event gets no secrets, but a `/ai-review` on it would give the key to
+      # a job that reads the fork's code.
       - id: pr
         if: steps.auth.outputs.ok == 'true'
         env:
@@ -103,10 +123,13 @@ jobs:
           set -euo pipefail
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER")
           ref=$(jq -r .base.ref <<< "$pr")
-          if [ "$ref" != "main" ]; then
-            echo "::notice::Pull request #$NUMBER targets $ref. Skipping."
-            exit 0
-          fi
+          case "$ref" in
+            main|dev) ;;
+            *)
+              echo "::notice::Pull request #$NUMBER targets $ref. Skipping."
+              exit 0
+              ;;
+          esac
           # A deleted fork leaves head.repo null, which is not this repository.
           head_repo=$(jq -r '.head.repo.full_name // ""' <<< "$pr")
           if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
@@ -131,13 +154,10 @@ jobs:
   codex:
     needs: preflight
     # An unresolved pull request means the comment guard let the event through
-    # but the pull request was out of scope. Dependabot pull requests read a
-    # separate, empty secret store, so the key arrives blank on their own
-    # event; `/ai-review` on one still works, because that event is ours.
+    # but the pull request was out of scope.
     if: >-
       needs.preflight.outputs.enabled == 'true'
       && needs.preflight.outputs.number != ''
-      && (github.event_name != 'pull_request' || github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     outputs:
       review: ${{ steps.run_codex.outputs['final-message'] }}
@@ -145,8 +165,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The head that preflight read, not the merge ref: a push after
-          # preflight must not change what is reviewed, and a pull request with
-          # a conflict has no merge ref. The prompt diffs base...head.
+          # preflight must not change what is reviewed, a pull request with a
+          # conflict has no merge ref, and the line numbers of the review
+          # comments are lines of the head.
           ref: ${{ needs.preflight.outputs.head }}
           # Keep the token out of .git/config. Codex reads files.
           persist-credentials: false
@@ -160,38 +181,56 @@ jobs:
           model: gpt-5.6-sol
           effort: medium
           permission-profile: ":read-only"
+          # The answer is JSON, so the `post` job can put each finding on its
+          # line. Strict mode needs every property in `required`.
+          output-schema: |
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["summary", "findings"],
+              "properties": {
+                "summary": {"type": "string"},
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "line", "severity", "title", "body"],
+                    "properties": {
+                      "path": {"type": "string"},
+                      "line": {"type": "integer"},
+                      "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                      "title": {"type": "string"},
+                      "body": {"type": "string"}
+                    }
+                  }
+                }
+              }
+            }
           prompt: |
             Review this pull request for correctness and security faults.
 
-            Read CLAUDE.md first. It holds this repository's rules.
-            Then read the change:
+            Read CLAUDE.md first, if it exists. It holds this repository's
+            rules. Then read .github/ai-review-focus.md. It lists where this
+            repository breaks; look hardest at those. Then read the change:
               git diff ${{ needs.preflight.outputs.base }}...${{ needs.preflight.outputs.head }}
 
-            This worker decodes files that an attacker controls. Look hardest
-            at these, which are the rules in CLAUDE.md that a change can break:
-            - A path that passes a file it did not fully decode, or lets a
-              byte of the source reach an output.
-            - Work, a download, or an allocation before the limit that
-              bounds it is checked.
-            - A bad file that becomes a function error, or a storage or
-              worker failure that becomes a refusal.
-            - A request above a ceiling that is lowered instead of refused.
-            - Metadata other than the RGB ICC profile copied to an output.
-            - Request or file data in an ffmpeg argument, or tool output in
-              a refusal detail or a log line.
-            - A log line with file bytes, EXIF values, or a position.
-            - A contract or HAZMAT_* change that README.md does not match.
-
-            This repository is public. Report any name of a deployment, a
-            bucket, a cloud account, or an internal system in code, docs, or
-            examples. The repository's own GitHub path is public and is not
-            a finding.
-
-            Rules for your output:
+            Rules for the findings:
             - Report only a fault you can name with a file and a line.
             - Do not report style. Do not restate the diff.
             - Do not suggest a rewrite of code that already works.
-            - If you find nothing, say so in one line and stop.
+            - `path` is relative to the repository root, as git prints it.
+            - `line` is a line number in the file at the head commit (the
+              new side of the diff). Use a line that the diff adds or
+              changes when the fault is there. Use the line where the fault
+              is, not the start of the function.
+            - `severity`: P0 breaks production or leaks a secret, P1 is a
+              real bug or a security fault, P2 is a fault with limited
+              impact, P3 is minor.
+            - `title` is one short sentence. `body` explains the fault and
+              the input or state that triggers it. Use Markdown.
+            - `summary` is one or two sentences about the change as a whole.
+              With no findings, say that you found no faults.
 
   post:
     needs: [preflight, codex]
@@ -205,11 +244,94 @@ jobs:
         env:
           REVIEW: ${{ needs.codex.outputs.review }}
           NUMBER: ${{ needs.preflight.outputs.number }}
+          BASE: ${{ needs.preflight.outputs.base }}
+          HEAD: ${{ needs.preflight.outputs.head }}
         with:
           script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: Number(process.env.NUMBER),
-              body: "## Codex review\n\n" + process.env.REVIEW,
+            const { owner, repo } = context.repo;
+            const pull_number = Number(process.env.NUMBER);
+            const head = process.env.HEAD;
+            const title = "## Codex review";
+
+            let review;
+            try {
+              review = JSON.parse(process.env.REVIEW);
+            } catch {
+              // Not the schema's JSON: post the text as it is.
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number, commit_id: head, event: "COMMENT",
+                body: `${title}\n\n${process.env.REVIEW}`,
+              });
+              return;
+            }
+
+            // GitHub accepts an inline comment only on a line that the diff
+            // shows on its new side: an added line or a context line. Read
+            // the diff of the reviewed commits, not the pull request's current
+            // one: a push while Codex ran must not move the lines.
+            const { data: compare } = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${process.env.BASE}...${head}`,
             });
+            const files = compare.files || [];
+            const commentable = new Map();
+            for (const file of files) {
+              const lines = new Set();
+              let line = 0;
+              for (const text of (file.patch || "").split("\n")) {
+                const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+                if (hunk) {
+                  line = Number(hunk[1]);
+                } else if (line > 0 && !text.startsWith("-") && !text.startsWith("\\")) {
+                  lines.add(line++);
+                }
+              }
+              commentable.set(file.filename, lines);
+            }
+
+            // Codex should give a repository path. Strip a diff prefix
+            // (`a/`, `b/`) only when the path as given is not in the diff and
+            // the stripped one is: `a/` can be a real directory.
+            const normalize = (path) => {
+              const p = path.replace(/^\.\//, "");
+              const bare = p.replace(/^[ab]\//, "");
+              return !commentable.has(p) && commentable.has(bare) ? bare : p;
+            };
+            const label = (f) => `**${f.severity}: ${f.title}**`;
+            const link = (f) =>
+              `https://github.com/${owner}/${repo}/blob/${head}/${f.path}#L${f.line}`;
+            const inline = [];
+            const outside = [];
+            for (const finding of review.findings) {
+              const f = { ...finding, path: normalize(finding.path) };
+              const { path } = f;
+              if (commentable.get(path)?.has(f.line)) {
+                inline.push({ path, line: f.line, side: "RIGHT", body: `${label(f)}\n\n${f.body}` });
+              } else {
+                outside.push(f);
+              }
+            }
+
+            const bodyFor = (list) => {
+              let body = `${title}\n\n${review.summary}`;
+              if (list.length) {
+                body += "\n\nNot on a line of the diff:\n\n" + list
+                  .map((f) => `- ${label(f)} [\`${f.path}:${f.line}\`](${link(f)})\n\n  ${f.body.replace(/\n/g, "\n  ")}`)
+                  .join("\n");
+              }
+              return body;
+            };
+
+            try {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number, commit_id: head, event: "COMMENT",
+                body: bodyFor(outside), comments: inline,
+              });
+            } catch (error) {
+              // A line GitHub refuses fails the whole review. Post every
+              // finding in the body instead, so none is lost.
+              core.warning(`Inline review refused (${error.status}): ${error.message}`);
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number, commit_id: head, event: "COMMENT",
+                body: bodyFor(review.findings.map((f) => ({ ...f, path: normalize(f.path) }))),
+              });
+            }
