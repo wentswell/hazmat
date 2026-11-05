@@ -149,9 +149,14 @@ jobs:
       needs.preflight.outputs.enabled == 'true'
       && needs.preflight.outputs.number != ''
     # A second review of the same pull request replaces the first. The group
-    # is on this job, not on the workflow, so only a run that passed the
-    # `auth` check can join it. A workflow-level group would let anyone who
-    # can comment cancel a running review with `/ai-review`.
+    # is on this job and on `post`, not on the workflow, so only a run that
+    # passed the `auth` check can join it. A workflow-level group would let
+    # anyone who can comment cancel a running review with `/ai-review`.
+    #
+    # A new run's `codex` cancels the old run's `codex` (so the old `post`
+    # never starts) or the old run's `post` (if the old `codex` had ended).
+    # The old `post` cannot cancel the new `codex`: it starts only after its
+    # own `codex` ends, and the new `codex` has already cancelled that one.
     concurrency:
       group: ai-review-${{ needs.preflight.outputs.number }}
       cancel-in-progress: true
@@ -233,6 +238,10 @@ jobs:
     needs: [preflight, codex]
     # An empty review posts nothing.
     if: needs.codex.outputs.review != ''
+    # The group of `codex`: a newer review cancels this one. See there.
+    concurrency:
+      group: ai-review-${{ needs.preflight.outputs.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       # To read the diff of the reviewed commits (`compare`). A job-level
