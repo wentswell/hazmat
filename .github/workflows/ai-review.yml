@@ -20,6 +20,26 @@ on:
   issue_comment:
     types: [created]
 
+# A second review of the same pull request replaces the first: the group
+# cancels the whole earlier run, so its `post` cannot publish a superseded
+# review. The group is on the workflow, not on the jobs: separate job groups
+# leave a gap between `codex` and `post` where an older run's `post` can cancel
+# a newer `codex`.
+#
+# Only the pull request's own events and a `/ai-review` from an owner, member,
+# or collaborator join that group. Any other comment, and a `/ai-review` from
+# anyone else, goes in a group of its own, so it cannot cancel a running
+# review. `author_association` only sorts the run into a group here. The `auth`
+# step in `preflight` still decides who may run the review.
+concurrency:
+  group: >-
+    ai-review-${{ github.event.pull_request.number || github.event.issue.number
+    }}-${{ github.event_name == 'pull_request'
+    || (startsWith(github.event.comment.body, '/ai-review')
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                    github.event.comment.author_association)) }}
+  cancel-in-progress: true
+
 jobs:
   preflight:
     # A comment event reaches this workflow for every issue in the repository.
@@ -148,18 +168,6 @@ jobs:
     if: >-
       needs.preflight.outputs.enabled == 'true'
       && needs.preflight.outputs.number != ''
-    # A second review of the same pull request replaces the first. The group
-    # is on this job and on `post`, not on the workflow, so only a run that
-    # passed the `auth` check can join it. A workflow-level group would let
-    # anyone who can comment cancel a running review with `/ai-review`.
-    #
-    # A new run's `codex` cancels the old run's `codex` (so the old `post`
-    # never starts) or the old run's `post` (if the old `codex` had ended).
-    # The old `post` cannot cancel the new `codex`: it starts only after its
-    # own `codex` ends, and the new `codex` has already cancelled that one.
-    concurrency:
-      group: ai-review-${{ needs.preflight.outputs.number }}
-      cancel-in-progress: true
     runs-on: ubuntu-latest
     outputs:
       review: ${{ steps.run_codex.outputs['final-message'] }}
@@ -238,10 +246,6 @@ jobs:
     needs: [preflight, codex]
     # An empty review posts nothing.
     if: needs.codex.outputs.review != ''
-    # The group of `codex`: a newer review cancels this one. See there.
-    concurrency:
-      group: ai-review-${{ needs.preflight.outputs.number }}
-      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       # To read the diff of the reviewed commits (`compare`). A job-level
