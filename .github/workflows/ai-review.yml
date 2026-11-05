@@ -238,6 +238,9 @@ jobs:
     if: needs.codex.outputs.review != ''
     runs-on: ubuntu-latest
     permissions:
+      # To read the diff of the reviewed commits (`compare`). A job-level
+      # block replaces the default, so it must name `contents` again.
+      contents: read
       pull-requests: write
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
