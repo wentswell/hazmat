@@ -23,12 +23,12 @@ release.
 ## 1. Download a release and check it
 
 ```sh
-gh release download v0.3.1 --repo wentswell/hazmat \
+gh release download v0.3.9 --repo wentswell/hazmat \
   --pattern '*.zip' --pattern checksums.txt
 shasum -a 256 -c checksums.txt --ignore-missing
 ```
 
-You should see `hazmat_v0.3.1_lambda_arm64.zip: OK`. Pick the newest tag from
+You should see `hazmat_v0.3.9_lambda_arm64.zip: OK`. Pick the newest tag from
 the [releases page](https://github.com/wentswell/hazmat/releases).
 
 ## 2. Set your variables
@@ -39,8 +39,8 @@ Create `terraform.tfvars`. It's in `.gitignore`.
 region      = "us-east-1"
 bucket_name = "my-app-uploads-example"   # must be globally unique
 
-zip_path   = "hazmat_v0.3.1_lambda_arm64.zip"
-zip_sha256 = "3d62a2effc1eb1c5fd4f7c25b71a13c9100c1c33dd7b093db40d86da228cba82"  # from checksums.txt
+zip_path   = "hazmat_v0.3.9_lambda_arm64.zip"
+zip_sha256 = "f98362eaf1df794edb84de302438788e3edec795ba2adce5ec76b2a716aefed0"  # from checksums.txt
 
 # Optional: lower the limits to what your app needs.
 environment = {
