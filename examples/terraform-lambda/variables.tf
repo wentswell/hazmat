@@ -29,7 +29,7 @@ variable "upload_prefix" {
 }
 
 variable "zip_path" {
-  description = "The path to the release zip, for example hazmat_v0.3.1_lambda_arm64.zip."
+  description = "The path to the release zip, for example hazmat_v0.3.9_lambda_arm64.zip."
   type        = string
 }
 
