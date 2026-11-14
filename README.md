@@ -230,7 +230,8 @@ optional, but they're still checked when you set them.
    request (say, a 2048px version and a 400px thumbnail), and hazmat writes a
    fresh JPEG for each one. It only ever scales down: if the original is smaller
    than a rendition's size, it stays at its original size. For an animated
-   image, only the first frame is used.
+   PNG, only its default image (the first frame) is used. Go's WebP decoder
+   can't read animated WebP, so an animated WebP is refused as `undecodable`.
 
 7. **Keep the color profile, drop everything else.** The only thing carried
    over from the original is the RGB color profile (ICC). It tells screens how
@@ -508,7 +509,7 @@ security release gets a new hazmat release.
 | Trigger | Workflow | What it does |
 |---|---|---|
 | Pull request, push to `main` | `ci.yml` | `test` job: `make test`, `make fuzz FUZZTIME=30s`, `make local-test`, and `make dist`. On a push to `main`, the `release` job then tags and publishes a release (see [Release](#release)). |
-| Pull request into `main` opened or marked ready, `/ai-review` comment | `ai-review.yml` | A Codex review of the change for correctness and security faults, posted as inline review comments. Comment `/ai-review` to run it again after a push. |
+| Pull request into `main` or `dev` opened or marked ready, `/ai-review` comment | `ai-review.yml` | A Codex review of the change for correctness and security faults, posted as inline review comments. Comment `/ai-review` to run it again after a push. |
 
 - Both CI jobs run on GitHub's arm64 runners (`ubuntu-24.04-arm`), because the
   zip holds ffmpeg built for the runner's architecture. The ffmpeg build is
