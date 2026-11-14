@@ -28,6 +28,10 @@ permissions: {}
 # anyone else, goes in a group of its own, so it cannot cancel a running
 # review. `author_association` only sorts the run into a group here. The `auth`
 # step in the shared workflow still decides who may run the review.
+#
+# Accepted: a read-only member or collaborator can still cancel a review.
+# Concurrency is applied before any step can read a permission, the
+# organization has no such members, and a cancel costs nothing.
 concurrency:
   group: >-
     ai-review-${{ github.event.pull_request.number || github.event.issue.number
@@ -39,6 +43,10 @@ concurrency:
 
 jobs:
   review:
+    # `@main`, not a commit SHA, on purpose: a change to the review reaches
+    # every repository when it merges. The `main` ruleset of wentswell/.github
+    # blocks direct pushes and needs a pull request that only an organization
+    # admin can merge.
     uses: wentswell/.github/.github/workflows/codex-review.yml@main
     # The most that any job in the shared workflow may have. Each job there
     # narrows it, and the job that runs the model gets read access only.
