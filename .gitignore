@@ -4,3 +4,5 @@
 # request.
 /work/
 /request.json
+# The cache of ruff, a Python linter, if it runs on the examples.
+.ruff_cache/
