@@ -230,7 +230,9 @@ optional, but they're still checked when you set them.
    request (say, a 2048px version and a 400px thumbnail), and hazmat writes a
    fresh JPEG for each one. It only ever scales down: if the original is smaller
    than a rendition's size, it stays at its original size. For an animated
-   PNG, only its default image (the first frame) is used. Go's WebP decoder
+   PNG, only its default image is used. That's usually the first frame, but an
+   animated PNG can also hold a separate still image that isn't part of the
+   animation, and then that still image is what you get. Go's WebP decoder
    can't read animated WebP, so an animated WebP is refused as `undecodable`.
 
 7. **Keep the color profile, drop everything else.** The only thing carried
