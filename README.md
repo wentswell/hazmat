@@ -381,8 +381,10 @@ The rules:
   `HAZMAT_MAX_VIDEO_SECONDS`. `frame_edge` is 16 up to
   `HAZMAT_MAX_OUTPUT_EDGE`, and `quality` is 1 to 100.
 - `frames` is either `{"count": N}` for N evenly spaced frames (1 to
-  `HAZMAT_MAX_FRAMES`), or `{"every_seconds": S}`, where a video of
-  `max_seconds` must not need more than `HAZMAT_MAX_FRAMES` frames. Frames are
+  `HAZMAT_MAX_FRAMES`), or `{"every_seconds": S}`. For an interval,
+  `ceil((max_seconds + 0.5) / S)` must be at most `HAZMAT_MAX_FRAMES`: the
+  longest video you accept, plus the half second a measured duration may run
+  over, must not need more frames than the limit. Frames are
   written to `prefix` + `frame_NN.jpg` (`frame_01.jpg`, `frame_02.jpg`, and so
   on). If the source key could be overwritten by one of the frame files (up to
   `HAZMAT_MAX_FRAMES`) in the same bucket, the request is an
